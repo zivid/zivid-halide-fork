@@ -4,6 +4,7 @@ project(Halide
         DESCRIPTION "Halide compiler and libraries"
         HOMEPAGE_URL "https://halide-lang.org")
 
+add_compile_definitions(DEBUG_RUNTIME)
 enable_testing()
 
 ##
@@ -154,3 +155,5 @@ if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
                           xargs $<TARGET_FILE:clang-format> -i -style=file)
     endif ()
 endif ()
+
+add_subdirectory(user)
