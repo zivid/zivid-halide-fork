@@ -266,6 +266,7 @@ protected:
     /** true if add_vector_typedefs() has been called. */
     bool using_vector_typedefs;
 
+    void emit_buffer_cleanup(const std::string &module_name, const std::vector<Buffer<>> &buffers, NameMangling mangling);
     void emit_argv_wrapper(const std::string &function_name,
                            const std::vector<LoweredArgument> &args);
     void emit_metadata_getter(const std::string &function_name,

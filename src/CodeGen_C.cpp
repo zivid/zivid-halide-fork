@@ -5,6 +5,7 @@
 #include "CodeGen_Internal.h"
 #include "Deinterleave.h"
 #include "FindIntrinsics.h"
+#include "IR.h"
 #include "IROperator.h"
 #include "Lerp.h"
 #include "Param.h"
@@ -1729,6 +1730,46 @@ void CodeGen_C::emit_metadata_getter(const std::string &function_name,
     stream << "}\n";
 }
 
+void CodeGen_C::emit_buffer_cleanup(const std::string &module_name, const std::vector<Buffer<>> &buffers, NameMangling mangling) {
+    if (mangling == NameMangling::Default) {
+        mangling = (target.has_feature(Target::CPlusPlusMangling) ? NameMangling::CPlusPlus : NameMangling::C);
+    }
+
+    set_name_mangling_mode(mangling);
+
+    stream << R"DESC(
+// Frees the buffers of static halide_buffer_t instances. After first
+// use, these buffers may be held on the GPU. This function must be
+// called before releasing the GPU context.
+
+// NOTE: https://github.com/halide/Halide/issues/6647 prevents the C
+// CodeGen from being used in production.
+)DESC";
+
+    stream << "HALIDE_FUNCTION_ATTRS\n";
+    stream << "int " << module_name << "_buffer_cleanup()";
+
+    if (is_header_or_extern_decl()) {
+        stream << ";\n";
+    } else {
+        stream << " {\n";
+        indent += 1;
+        for (const auto &buffer : buffers) {
+            const std::string result_var = "result_" + buffer.name();
+            const std::string buffer_name = "_" + buffer.name() + "_buffer";
+            stream << get_indent() << "int " << result_var << " = "
+                   << "halide_device_free(nullptr, " << buffer_name << ");\n";
+            stream << get_indent() << "if (" << result_var << " != 0) return " << result_var << ";\n";
+            stream << get_indent() << Call::buffer_set_host_dirty << "(" << buffer_name << ", true);\n";
+        }
+        stream << get_indent() << "return 0;\n";
+        stream << "}\n";
+    }
+    stream << "\n";
+
+    set_name_mangling_mode(mangling);
+}
+
 void CodeGen_C::compile(const Module &input) {
     TypeInfoGatherer type_info;
     for (const auto &f : input.functions()) {
@@ -1791,6 +1832,12 @@ void CodeGen_C::compile(const Module &input) {
 
     for (const auto &b : input.buffers()) {
         compile(b);
+    }
+
+    if (!input.buffers().empty()) {
+        // If there is a buffer, there is likely a Func using it.
+        const auto mangling = input.functions().at(0).name_mangling;
+        emit_buffer_cleanup(input.name(), input.buffers(), mangling);
     }
     const auto metadata_name_map = input.get_metadata_name_map();
     for (const auto &f : input.functions()) {
