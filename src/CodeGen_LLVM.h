@@ -91,7 +91,8 @@ protected:
     /** Compile a specific halide declaration into the llvm Module. */
     // @{
     virtual void compile_func(const LoweredFunc &func, const std::string &simple_name, const std::string &extern_name);
-    virtual void compile_buffer(const Buffer<> &buffer);
+    virtual llvm::GlobalVariable *compile_buffer(const Buffer<> &buffer);
+    virtual void add_buffer_cleanup(const std::string &fn_name, const std::vector<llvm::GlobalVariable *> &buffers);
     // @}
 
     /** Helper functions for compiling Halide functions to llvm
