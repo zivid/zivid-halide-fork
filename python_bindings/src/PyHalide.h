@@ -11,6 +11,12 @@
 #include <string>
 #include <vector>
 
+// MSVC does not define `ssize_t` used in PyBuffer.cpp
+#if defined(_MSC_VER)
+#include <BaseTsd.h>
+typedef SSIZE_T ssize_t;
+#endif
+
 // Everyone needs Halide.h
 #include "Halide.h"
 
