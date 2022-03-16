@@ -15,6 +15,7 @@
 #include "ExprUsesVar.h"
 #include "ExternFuncArgument.h"
 #include "FindIntrinsics.h"
+#include "IR.h"
 #include "IREquality.h"
 #include "IROperator.h"
 #include "IRPrinter.h"
@@ -467,8 +468,15 @@ std::unique_ptr<llvm::Module> CodeGen_LLVM::compile(const Module &input) {
 
     // Generate the code for this module.
     debug(1) << "Generating llvm bitcode...\n";
+
+    std::vector<GlobalVariable *> buffer_vars;
     for (const auto &b : input.buffers()) {
-        compile_buffer(b);
+        buffer_vars.push_back(compile_buffer(b));
+    }
+
+    if (!buffer_vars.empty()) {
+        const auto mangling = input.functions().at(0).name_mangling;  // assume the first function's mangling
+        add_buffer_cleanup(get_mangled_names(input.name() + string("_buffer_cleanup"), LinkageType::External, mangling, {}, target).extern_name, buffer_vars);
     }
 
     vector<MangledNames> function_names;
@@ -795,7 +803,7 @@ void CodeGen_LLVM::trigger_destructor(llvm::Function *destructor_fn, Value *stac
     builder->CreateCall(call_destructor, args);
 }
 
-void CodeGen_LLVM::compile_buffer(const Buffer<> &buf) {
+GlobalVariable *CodeGen_LLVM::compile_buffer(const Buffer<> &buf) {
     // Embed the buffer declaration as a global.
     internal_assert(buf.defined());
 
@@ -841,15 +849,72 @@ void CodeGen_LLVM::compile_buffer(const Buffer<> &buf) {
     Constant *buffer_struct = ConstantStruct::get(halide_buffer_t_type, fields);
 
     // Embed the halide_buffer_t and make it point to the data array.
+    string buffer_symbol = buf.name() + ".buffer";
     GlobalVariable *global = new GlobalVariable(*module, halide_buffer_t_type,
                                                 false, GlobalValue::PrivateLinkage,
-                                                nullptr, buf.name() + ".buffer");
+                                                nullptr, buffer_symbol);
     global->setInitializer(buffer_struct);
 
     // Finally, dump it in the symbol table
     Constant *zero[] = {ConstantInt::get(i32_t, 0)};
     Constant *global_ptr = ConstantExpr::getInBoundsGetElementPtr(halide_buffer_t_type, global, zero);
-    sym_push(buf.name() + ".buffer", global_ptr);
+    sym_push(buffer_symbol, global_ptr);
+
+    return global;
+}
+
+void CodeGen_LLVM::add_buffer_cleanup(const std::string &fn_name, const std::vector<llvm::GlobalVariable *> &buffers) {
+    debug(1) << "Generating cleanup method for images in " << module->getName().str() << '\n';
+    llvm::Function *func = llvm::Function::Create(FunctionType::get(i32_t, false), llvm::Function::ExternalLinkage, fn_name, *module);
+    func->setCallingConv(CallingConv::C);
+
+    llvm::Function *device_free = module->getFunction("halide_device_free");
+    internal_assert(device_free);
+
+    llvm::Function *set_host_dirty = module->getFunction("_halide_buffer_set_host_dirty");
+    internal_assert(set_host_dirty);
+
+    Value *user_context = ConstantPointerNull::get(i8_t->getPointerTo());
+    /* Get the definition of `halide_buffer_t` */
+    StructType *buffer_struct = get_llvm_struct_type_by_name(module.get(), "struct.halide_buffer_t.4");
+
+    vector<BasicBlock *> blocks;
+    for (GlobalVariable *buffer : buffers) {
+        blocks.push_back(BasicBlock::Create(module->getContext(), Twine("clean_", buffer->getName()), func));
+    }
+
+    BasicBlock *return_block = BasicBlock::Create(module->getContext(), "return", func);
+    builder->SetInsertPoint(return_block);
+    builder->CreateRet(ConstantInt::get(i32_t, 0));
+
+    BasicBlock *dirty_block = BasicBlock::Create(module->getContext(), "set_host_buffer_dirty", func);
+
+    for (size_t i = 0; i < buffers.size(); ++i) {
+        builder->SetInsertPoint(blocks[i]);
+
+        Value *buffer_ptr = ConstantExpr::getInBoundsGetElementPtr(halide_buffer_t_type, buffers[i], ConstantInt::get(i32_t, 0));
+        Value *cast_buffer = builder->CreatePointerCast(buffer_ptr, buffer_struct->getPointerTo());
+        Value *free_args[] = {user_context, cast_buffer};
+        Value *result = builder->CreateCall(device_free, free_args);
+
+        BasicBlock *early_return = BasicBlock::Create(module->getContext(), Twine("return_", buffers[i]->getName()), func);
+
+        bool is_last_buffer = i == buffers.size() - 1;
+        Value *is_success = builder->CreateICmpEQ(result, ConstantInt::get(i32_t, 0));
+        builder->CreateCondBr(is_success, is_last_buffer ? dirty_block : blocks[i + 1], early_return);
+
+        builder->SetInsertPoint(early_return);
+        builder->CreateRet(result);
+
+        builder->SetInsertPoint(dirty_block);
+        Value *set_dirty_args[] = {buffer_ptr, ConstantInt::get(i1_t, 1)};
+        builder->CreateCall(set_host_dirty, set_dirty_args);
+    }
+
+    builder->SetInsertPoint(dirty_block);
+    builder->CreateBr(return_block);
+
+    internal_assert(!verifyFunction(*func, &llvm::errs()));
 }
 
 Constant *CodeGen_LLVM::embed_constant_scalar_value_t(const Expr &e) {
