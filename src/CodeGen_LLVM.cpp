@@ -855,8 +855,10 @@ void CodeGen_LLVM::add_buffer_cleanup(const std::string &fn_name, const std::vec
     internal_assert(set_host_dirty);
 
     Value *user_context = ConstantPointerNull::get(i8_t->getPointerTo());
-    /* Get the definition of `halide_buffer_t` */
-    StructType *buffer_struct = get_llvm_struct_type_by_name(module.get(), "struct.halide_buffer_t.4");
+    /* Get the declaration or definition of `halide_buffer_t`, which depends on the presence of TargetFeature.NoRuntime */
+    StructType *buffer_struct_def = get_llvm_struct_type_by_name(module.get(), "struct.halide_buffer_t.4");
+    StructType *buffer_struct_decl = get_llvm_struct_type_by_name(module.get(), "struct.halide_buffer_t");
+    StructType *buffer_struct = buffer_struct_def ? buffer_struct_def : buffer_struct_decl;
 
     vector<BasicBlock *> blocks;
     for (GlobalVariable *buffer : buffers) {
