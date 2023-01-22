@@ -42,12 +42,16 @@ cmake_dependent_option(Halide_BUNDLE_LLVM "When built as a static library, inclu
 # Promote LLVM/Clang executable targets
 ##
 
+if(PROMOTE_IMPORTED_CLANG_LLVM)
+
 set_target_properties(llvm-as clang PROPERTIES IMPORTED_GLOBAL TRUE)
 
 # clang-tools-extra is optional, but provides the clang-format target
 if (TARGET clang-format)
     set_target_properties(clang-format PROPERTIES IMPORTED_GLOBAL TRUE)
 endif ()
+
+endif()
 
 ##
 # Create options for including or excluding LLVM backends.
