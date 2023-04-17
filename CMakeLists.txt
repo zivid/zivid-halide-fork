@@ -156,4 +156,4 @@ if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     endif ()
 endif ()
 
-add_subdirectory(user)
+#add_subdirectory(user)
