@@ -768,6 +768,24 @@ public:
         decref();
     }
 
+    /** Get the number of references to the device memory this buffer is pointing to.
+     * Returns 0 if no device memory is associated with the buffer. */
+    int deviceReferenceCount() {
+        if (!dev_ref_count) {
+            return 0;
+        }
+        return dev_ref_count->count;
+    }
+
+    /** Get the number of references to the hist memory this buffer is pointing to.
+     * Returns 0 if no host memory is associated with the buffer. */
+    int hostReferenceCount() {
+        if (!alloc) {
+            return 0;
+        }
+        return alloc->ref_count;
+    }
+
     /** Drop reference to any owned device memory, possibly freeing it
      * if this buffer held the last reference to it. Asserts that
      * device_dirty is false. */
