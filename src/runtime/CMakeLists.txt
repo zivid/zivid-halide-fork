@@ -167,6 +167,12 @@ set(RUNTIME_CXX_FLAGS
 option(Halide_CLANG_TIDY_BUILD "Generate fake compile jobs for runtime files when running clang-tidy." OFF)
 mark_as_advanced(Halide_CLANG_TIDY_BUILD)
 
+find_program(CLANG_EXECUTABLE NAMES clang)
+
+if(NOT CLANG_EXECUTABLE)
+    message(FATAL_ERROR "clang not found!")
+endif()
+
 foreach (i IN LISTS RUNTIME_CPP)
     foreach (j IN ITEMS 32 64)
         # -fpic needs special treatment; see below on windows 64bits
@@ -243,7 +249,7 @@ foreach (i IN LISTS RUNTIME_CPP)
                 target_compile_definitions(${basename} PRIVATE ${RUNTIME_DEFINES})
             else()
                 add_custom_command(OUTPUT "${LL}"
-                                   COMMAND ${CMAKE_C_COMPILER_LAUNCHER} $<TARGET_FILE:clang> ${clang_flags} -o "${LL}" "$<SHELL_PATH:${SOURCE}>"
+                                   COMMAND ${CMAKE_C_COMPILER_LAUNCHER} ${CLANG_EXECUTABLE} ${clang_flags} -o "${LL}" "$<SHELL_PATH:${SOURCE}>"
                                    DEPENDS "${SOURCE}"
                                    DEPFILE "${basename}.d"
                                    VERBATIM)
@@ -340,4 +346,3 @@ add_library(Halide_Runtime INTERFACE)
 add_library(Halide::Runtime ALIAS Halide_Runtime)
 target_include_directories(Halide_Runtime INTERFACE $<BUILD_INTERFACE:${Halide_BINARY_DIR}/include>)
 set_target_properties(Halide_Runtime PROPERTIES EXPORT_NAME Runtime)
-
