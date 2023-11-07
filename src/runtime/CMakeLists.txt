@@ -167,7 +167,7 @@ set(RUNTIME_CXX_FLAGS
 option(Halide_CLANG_TIDY_BUILD "Generate fake compile jobs for runtime files when running clang-tidy." OFF)
 mark_as_advanced(Halide_CLANG_TIDY_BUILD)
 
-find_program(CLANG_EXECUTABLE NAMES clang-${LLVM_VERSION_MAJOR})
+find_program(CLANG_EXECUTABLE NAMES clang-15)
 
 if(NOT CLANG_EXECUTABLE)
     message(FATAL_ERROR "clang not found!")
