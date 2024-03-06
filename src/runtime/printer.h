@@ -199,11 +199,7 @@ typedef Printer<BasicPrinter> print;
 typedef Printer<ErrorPrinter> error;
 typedef Printer<StringStreamPrinter> stringstream;
 
-#ifdef DEBUG_RUNTIME
 typedef Printer<BasicPrinter> debug;
-#else
-typedef SinkPrinter debug;
-#endif
 }  // namespace
 
 }  // namespace Internal
