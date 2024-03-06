@@ -249,10 +249,10 @@ WEAK int halide_device_free(void *user_context, struct halide_buffer_t *buf) {
         device_interface->impl->use_module();
         result = device_interface->impl->device_free(user_context, buf);
         device_interface->impl->release_module();
-        halide_assert(user_context, buf->device == 0);
         if (result) {
             return halide_error_code_device_free_failed;
         } else {
+            halide_assert(user_context, buf->device == 0);
             return 0;
         }
     }
