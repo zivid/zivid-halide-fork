@@ -297,7 +297,63 @@ struct device_handle {
 
 WEAK Halide::Internal::GPUCompilationCache<cl_context, cl_program> compilation_cache;
 
-WEAK bool validate_device_pointer(void *user_context, halide_buffer_t *buf, size_t size = 0) {
+WEAK int get_base_addr_align_byte(void *user_context, cl_context context) {
+    cl_device_id device;
+    cl_int err = clGetContextInfo(context, CL_CONTEXT_DEVICES, sizeof(device), &device, nullptr);
+    if (err != CL_SUCCESS) {
+        error(user_context) << "CL: clGetContextInfo(CL_CONTEXT_DEVICES) failed: "
+                            << get_opencl_error_name(err);
+        return err;
+    }
+
+    cl_uint base_addr_align_bits = 0;
+    clGetDeviceInfo(device, CL_DEVICE_MEM_BASE_ADDR_ALIGN, sizeof(base_addr_align_bits), &base_addr_align_bits, nullptr);
+    if (err != CL_SUCCESS) {
+        error(user_context) << "CL: clGetDeviceInfo(CL_DEVICE_MEM_BASE_ADDR_ALIGN) failed: "
+                            << get_opencl_error_name(err);
+        return err;
+    }
+
+    if ((base_addr_align_bits % 8) != 0) {
+        error(user_context) << "Broken assumption: CL_DEVICE_MEM_BASE_ADDR_ALIGN is not aligned to full bytes, got value (in bits): " << base_addr_align_bits;
+        return halide_error_code_generic_error;
+    }
+
+    return base_addr_align_bits / 8;
+}
+
+WEAK bool validate_host_pointer(void *user_context, halide_buffer_t *buf) {
+    if (buf->host == nullptr) {
+        return true;
+    }
+
+    int element_size = buf->type.bytes();
+
+    bool aligned_to_element = ((size_t(buf->host) % element_size) == 0);
+    bool aligned_to_16 = ((size_t(buf->host) % 16) == 0);
+
+    debug(user_context) << "CL: validate host " << (void *)buf->host << " type: " << buf->type
+                        << "  element size: " << element_size << "  aligned to element: " << aligned_to_element
+                        << "  aligned to 16: " << aligned_to_16 << "\n";
+
+    if (!aligned_to_element)
+    {
+        error(user_context) << "CL: Bad host pointer " << (void *)buf->host
+                            << ": Not aligned to element, type: " << buf->type << "\n";
+        return false;
+    }
+
+    if (!aligned_to_16)
+    {
+        debug(user_context) << "CL ZividHalide warning: Bad host pointer " << (void *)buf->host
+                            << ": Not aligned to 16 bytes, type: " << buf->type << "\n";
+    }
+
+    return true;
+}
+
+
+WEAK bool validate_device_pointer(void *user_context, const halide_buffer_t *buf, size_t size = 0) {
     if (buf->device == 0) {
         return true;
     }
@@ -315,18 +371,39 @@ WEAK bool validate_device_pointer(void *user_context, halide_buffer_t *buf, size
     cl_int result = clGetMemObjectInfo(dev_ptr, CL_MEM_SIZE, sizeof(size_t), &real_size, nullptr);
     if (result != CL_SUCCESS) {
         error(user_context) << "CL: Bad device pointer " << (void *)dev_ptr
-                            << ": clGetMemObjectInfo returned "
+                            << ": clGetMemObjectInfo(CL_MEM_SIZE) returned "
                             << get_opencl_error_name(result);
         return false;
     }
 
     debug(user_context) << "CL: validate " << (void *)dev_ptr << " offset: " << offset
                         << ": asked for " << (uint64_t)size
-                        << ", actual allocated " << (uint64_t)real_size << "\n";
+                        << ", actual allocated " << (uint64_t)real_size << "\nHello from Halide runtime! v6\n";
 
     if (size) {
         halide_assert(user_context, real_size >= (size + offset) && "Validating pointer with insufficient size");
     }
+
+    cl_context cl_context;
+    result = clGetMemObjectInfo(dev_ptr, CL_MEM_CONTEXT, sizeof(cl_context), &cl_context, nullptr);
+    if (result != CL_SUCCESS) {
+        error(user_context) << "CL: Bad device pointer " << (void *)dev_ptr
+                            << ": clGetMemObjectInfo(CL_MEM_CONTEXT) returned "
+                            << get_opencl_error_name(result);
+        return false;
+    }
+
+    int base_addr_align_byte = get_base_addr_align_byte(user_context, cl_context);
+    if (base_addr_align_byte <= 0) {
+        error(user_context) << "CL: validate_device_pointer/get_base_addr_align_byte failed\n";
+        return false;
+    }
+
+    if ((offset % base_addr_align_byte) != 0)
+    {
+        error(user_context) << "ZividHalide pointer validation error: Misaligned sub-buffer offset. Offset: " << offset << "  Required alignment: " << base_addr_align_byte;
+    }
+
     return true;
 }
 
@@ -478,6 +555,7 @@ WEAK int create_opencl_context(void *user_context, cl_context *ctx, cl_command_q
     cl_ulong max_mem_alloc_size = 0;
     cl_ulong local_mem_size = 0;
     cl_uint max_compute_units = 0;
+    cl_uint mem_base_addr_align = 0;
     size_t max_work_group_size = 0;
     cl_uint max_work_item_dimensions = 0;
     size_t max_work_item_sizes[4] = {
@@ -498,6 +576,7 @@ WEAK int create_opencl_context(void *user_context, cl_context *ctx, cl_command_q
         {&max_mem_alloc_size, sizeof(max_mem_alloc_size), CL_DEVICE_MAX_MEM_ALLOC_SIZE},
         {&local_mem_size, sizeof(local_mem_size), CL_DEVICE_LOCAL_MEM_SIZE},
         {&max_compute_units, sizeof(max_compute_units), CL_DEVICE_MAX_COMPUTE_UNITS},
+        {&mem_base_addr_align, sizeof(mem_base_addr_align), CL_DEVICE_MEM_BASE_ADDR_ALIGN},
         {&max_work_group_size, sizeof(max_work_group_size), CL_DEVICE_MAX_WORK_GROUP_SIZE},
         {&max_work_item_dimensions, sizeof(max_work_item_dimensions), CL_DEVICE_MAX_WORK_ITEM_DIMENSIONS},
         {&max_work_item_sizes[0], sizeof(max_work_item_sizes), CL_DEVICE_MAX_WORK_ITEM_SIZES},
@@ -521,6 +600,7 @@ WEAK int create_opencl_context(void *user_context, cl_context *ctx, cl_command_q
         << "      max mem alloc size: " << max_mem_alloc_size / (1024 * 1024) << " MB\n"
         << "      local mem size: " << local_mem_size << "\n"
         << "      max compute units: " << max_compute_units << "\n"
+        << "      mem base addr align: " << mem_base_addr_align << "\n"
         << "      max workgroup size: " << (uint64_t)max_work_group_size << "\n"
         << "      max work item dimensions: " << max_work_item_dimensions << "\n"
         << "      max work item sizes: " << (uint64_t)max_work_item_sizes[0]
@@ -654,7 +734,7 @@ WEAK int halide_opencl_device_free(void *user_context, halide_buffer_t *buf) {
 
     debug(user_context)
         << "CL: halide_opencl_device_free (user_context: " << user_context
-        << ", buf: " << buf << ") cl_mem: " << dev_ptr << "\n";
+        << ", buf: " << buf << ", cl_mem: " << dev_ptr << ")\n";
 
     ClContext ctx(user_context);
     if (ctx.error_code != CL_SUCCESS) {
@@ -770,7 +850,7 @@ WEAK int halide_opencl_initialize_kernels(void *user_context, void **state_ptr, 
 
 WEAK void halide_opencl_finalize_kernels(void *user_context, void *state_ptr) {
     debug(user_context)
-        << "CL: halide_opencl_finalize_kernels (user_context: " << user_context
+        << "CL: halide_opencl_finalize_kernels: user_context: " << user_context
         << ", state_ptr: " << state_ptr << "\n";
     ClContext ctx(user_context);
     if (ctx.error_code == CL_SUCCESS) {
@@ -887,7 +967,7 @@ WEAK int halide_opencl_device_malloc(void *user_context, halide_buffer_t *buf) {
         free(dev_handle);
         return err;
     } else {
-        debug(user_context) << (void *)dev_ptr << " device_handle: " << dev_handle << "\n";
+        debug(user_context) << "    cl_mem: " << (void *)dev_ptr << " device_handle: " << dev_handle << "\n";
     }
 
     dev_handle->mem = dev_ptr;
@@ -999,17 +1079,24 @@ WEAK int halide_opencl_buffer_copy(void *user_context, struct halide_buffer_t *s
 
         debug(user_context)
             << "CL: halide_opencl_buffer_copy (user_context: " << user_context
-            << ", src: " << src << ", dst: " << dst << ")\n";
+            << ", src: " << src << ", dst: " << dst << ", from host: " << from_host << ", to host: " << to_host << ")\n";
 
 #ifdef DEBUG_RUNTIME
         uint64_t t_before = halide_current_time_ns(user_context);
-        if (!from_host) {
+        if (from_host) {
+            halide_assert(user_context, validate_host_pointer(user_context, src));
+        } else {
             halide_assert(user_context, validate_device_pointer(user_context, src));
         }
-        if (!to_host) {
+
+        if(to_host) {
+            halide_assert(user_context, validate_host_pointer(user_context, dst));
+        } else {
             halide_assert(user_context, validate_device_pointer(user_context, dst));
         }
 #endif
+
+
 
         err = opencl_do_multidimensional_copy(user_context, ctx, c, c.src_begin, 0, dst->dimensions, from_host, to_host);
 
@@ -1055,6 +1142,12 @@ WEAK int halide_opencl_run(void *user_context,
     ClContext ctx(user_context);
     if (ctx.error_code != CL_SUCCESS) {
         return ctx.error_code;
+    }
+
+    int base_addr_align_byte = get_base_addr_align_byte(user_context, ctx.context);
+    if(base_addr_align_byte <= 0) {
+        error(user_context) << "CL: get_base_addr_align_byte failed\n";
+        return base_addr_align_byte;
     }
 
 #ifdef DEBUG_RUNTIME
@@ -1122,15 +1215,22 @@ WEAK int halide_opencl_run(void *user_context,
             cl_mem mem = ((device_handle *)((halide_buffer_t *)this_arg)->device)->mem;
             uint64_t offset = ((device_handle *)((halide_buffer_t *)this_arg)->device)->offset;
 
+            if ((offset % base_addr_align_byte) != 0)
+            {
+                error(user_context) << "ZividHalide error: Misaligned sub-buffer offset. Offset: " << offset << "  Required alignment: " << base_addr_align_byte;
+                // err = halide_error_code_generic_error;
+            }
             if (offset != 0) {
-                cl_buffer_region region = {(size_t)offset, ((halide_buffer_t *)this_arg)->size_in_bytes()};
+                size_t size_in_bytes = ((halide_buffer_t *)this_arg)->size_in_bytes();
+                debug(user_context) << "Creating sub buffer, clCreateSubBuffer (cl_mem: " << (void *)mem << ", size: " << (uint64_t)size_in_bytes << ", offset: " << offset << ")\n";
+                cl_buffer_region region = {(size_t)offset, size_in_bytes};
                 // The sub-buffer encompasses the linear range of addresses that
                 // span the crop.
                 mem = clCreateSubBuffer(mem, CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
                 sub_buffers[sub_buffers_saved++] = mem;
             }
             if (err == CL_SUCCESS) {
-                debug(user_context) << "Mapped dev handle is: " << (void *)mem << "\n";
+                debug(user_context) << "Mapped dev handle is: " << (void *)mem << "  offset: " << offset << "\n";
                 err = clSetKernelArg(f, i, sizeof(mem), &mem);
             }
         } else {
@@ -1274,6 +1374,10 @@ WEAK int opencl_device_crop_from_offset(void *user_context,
     if (ctx.error_code != CL_SUCCESS) {
         return ctx.error_code;
     }
+    if (!validate_device_pointer(user_context, src)) {
+        error(user_context) << "CL: opencl_device_crop_from_offset/validate_device_pointer src failed\n";
+        return halide_error_code_generic_error;
+    }
 
     dst->device_interface = src->device_interface;
 
@@ -1283,10 +1387,20 @@ WEAK int opencl_device_crop_from_offset(void *user_context,
         return halide_error_code_out_of_memory;
     }
 
+    uint64_t new_offset = ((device_handle *)src->device)->offset + offset;
     clRetainMemObject(((device_handle *)src->device)->mem);
     new_dev_handle->mem = ((device_handle *)src->device)->mem;
-    new_dev_handle->offset = ((device_handle *)src->device)->offset + offset;
+    new_dev_handle->offset = new_offset;
     dst->device = (uint64_t)new_dev_handle;
+
+    debug(user_context)
+        << "CL: opencl_device_crop_from_offset(user_context: " << user_context << ", cl_mem: " << ((device_handle *)src->device)->mem
+        << ", src: " << src << ", dst: " << dst << ", delta offset: " << offset << ", new offset: " << new_offset << "\n";
+
+    if (!validate_device_pointer(user_context, dst)) {
+        error(user_context) << "CL: opencl_device_crop_from_offset/validate_device_pointer dst failed\n";
+        return halide_error_code_generic_error;
+    }
 
     return 0;
 }
@@ -1318,7 +1432,7 @@ WEAK int halide_opencl_device_release_crop(void *user_context,
 
     debug(user_context)
         << "CL: halide_opencl_device_release_crop(user_context: " << user_context
-        << ", buf: " << buf << ") cl_mem: " << dev_ptr << " offset: " << ((device_handle *)buf->device)->offset << "\n";
+        << ", buf: " << buf << ", cl_mem: " << dev_ptr << ", offset: " << ((device_handle *)buf->device)->offset << ")\n";
 
     ClContext ctx(user_context);
     if (ctx.error_code != CL_SUCCESS) {
@@ -1711,10 +1825,15 @@ WEAK int halide_opencl_image_buffer_copy(void *user_context, struct halide_buffe
 
 #ifdef DEBUG_RUNTIME
         uint64_t t_before = halide_current_time_ns(user_context);
-        if (!from_host) {
+        if (from_host) {
+            halide_assert(user_context, validate_host_pointer(user_context, src));
+        } else {
             halide_assert(user_context, validate_device_pointer(user_context, src));
         }
-        if (!to_host) {
+
+        if (to_host) {
+            halide_assert(user_context, validate_host_pointer(user_context, dst));
+        } else {
             halide_assert(user_context, validate_device_pointer(user_context, dst));
         }
 #endif
