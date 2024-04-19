@@ -338,7 +338,7 @@ WEAK bool validate_host_pointer(void *user_context, halide_buffer_t *buf) {
 
     if (!aligned_to_element)
     {
-        error(user_context) << "CL: Bad host pointer " << (void *)buf->host
+        error(user_context) << "CL ZividHalide error: Bad host pointer " << (void *)buf->host
                             << ": Not aligned to element, type: " << buf->type << "\n";
         return false;
     }
@@ -368,17 +368,36 @@ WEAK bool validate_device_pointer(void *user_context, const halide_buffer_t *buf
     uint64_t offset = ((device_handle *)buf->device)->offset;
 
     size_t real_size;
-    cl_int result = clGetMemObjectInfo(dev_ptr, CL_MEM_SIZE, sizeof(size_t), &real_size, nullptr);
+    cl_int result = clGetMemObjectInfo(dev_ptr, CL_MEM_SIZE, sizeof(real_size), &real_size, nullptr);
     if (result != CL_SUCCESS) {
         error(user_context) << "CL: Bad device pointer " << (void *)dev_ptr
                             << ": clGetMemObjectInfo(CL_MEM_SIZE) returned "
                             << get_opencl_error_name(result);
         return false;
     }
+    size_t real_offset;
+    result = clGetMemObjectInfo(dev_ptr, CL_MEM_OFFSET, sizeof(real_offset), &real_offset, nullptr);
+    if (result != CL_SUCCESS) {
+        error(user_context) << "CL: Bad device pointer " << (void *)dev_ptr
+                            << ": clGetMemObjectInfo(CL_MEM_OFFSET) returned "
+                            << get_opencl_error_name(result);
+        return false;
+    }
+
+    cl_uint mem_reference_count;
+    result = clGetMemObjectInfo(dev_ptr, CL_MEM_REFERENCE_COUNT, sizeof(mem_reference_count), &mem_reference_count, nullptr);
+    if (result != CL_SUCCESS) {
+        error(user_context) << "CL: Bad device pointer " << (void *)dev_ptr
+                            << ": clGetMemObjectInfo(CL_MEM_REFERENCE_COUNT) returned "
+                            << get_opencl_error_name(result);
+        return false;
+    }
 
     debug(user_context) << "CL: validate " << (void *)dev_ptr << " offset: " << offset
                         << ": asked for " << (uint64_t)size
-                        << ", actual allocated " << (uint64_t)real_size << "\nHello from Halide runtime! v6\n";
+                        << ", actual allocated " << (uint64_t)real_size
+                        << ", actual offset " << (uint64_t)real_offset
+                        << "\nHello from Halide runtime! v7\n";
 
     if (size) {
         halide_assert(user_context, real_size >= (size + offset) && "Validating pointer with insufficient size");
@@ -401,7 +420,7 @@ WEAK bool validate_device_pointer(void *user_context, const halide_buffer_t *buf
 
     if ((offset % base_addr_align_byte) != 0)
     {
-        error(user_context) << "ZividHalide pointer validation error: Misaligned sub-buffer offset. Offset: " << offset << "  Required alignment: " << base_addr_align_byte;
+        debug(user_context) << "ZividHalide warning: Pointer validation, offset not aligned to base alignment. Offset: " << offset << "  Required alignment: " << base_addr_align_byte;
     }
 
     return true;
@@ -1241,6 +1260,7 @@ WEAK int halide_opencl_run(void *user_context,
             error(user_context) << "CL: clSetKernelArg failed: "
                                 << get_opencl_error_name(err);
             for (int sub_buf_index = 0; sub_buf_index < sub_buffers_saved; sub_buf_index++) {
+                debug(user_context) << "    clReleaseMemObject " << (void *)sub_buffers[sub_buf_index] << "\n";
                 clReleaseMemObject(sub_buffers[sub_buf_index]);
             }
             free(sub_buffers);
@@ -1274,6 +1294,7 @@ WEAK int halide_opencl_run(void *user_context,
     // Now that the kernel is enqueued, OpenCL is holding its own
     // references to sub buffers and the local ones can be released.
     for (int sub_buf_index = 0; sub_buf_index < sub_buffers_saved; sub_buf_index++) {
+        debug(user_context) << "    clReleaseMemObject " << (void *)sub_buffers[sub_buf_index] << "\n";
         clReleaseMemObject(sub_buffers[sub_buf_index]);
     }
     free(sub_buffers);
