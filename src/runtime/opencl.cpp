@@ -397,7 +397,8 @@ WEAK bool validate_device_pointer(void *user_context, const halide_buffer_t *buf
                         << ": asked for " << (uint64_t)size
                         << ", actual allocated " << (uint64_t)real_size
                         << ", actual offset " << (uint64_t)real_offset
-                        << "\nHello from Halide runtime! v7\n";
+                        << ", mem ref count " << (uint64_t)mem_reference_count
+                        << "\nHello from Halide runtime! v8\n";
 
     if (size) {
         halide_assert(user_context, real_size >= (size + offset) && "Validating pointer with insufficient size");
