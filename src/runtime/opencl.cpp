@@ -954,8 +954,11 @@ WEAK int opencl_do_multidimensional_copy(void *user_context, ClContext &ctx,
                                       CL_FALSE, src_idx + ((device_handle *)c.src)->offset, c.chunk_size, (void *)(c.dst + dst_idx),
                                       0, nullptr, nullptr);
         } else if (from_host && !to_host) {
+            // Use a synchronous copy from host to device
+            // Workaround for crash observed on intel drivers with Windows
+            auto blocking_write = CL_TRUE;
             err = clEnqueueWriteBuffer(ctx.cmd_queue, ((device_handle *)c.dst)->mem,
-                                       CL_FALSE, dst_idx + ((device_handle *)c.dst)->offset, c.chunk_size, (void *)(c.src + src_idx),
+                                       blocking_write, dst_idx + ((device_handle *)c.dst)->offset, c.chunk_size, (void *)(c.src + src_idx),
                                        0, nullptr, nullptr);
         } else if (!from_host && !to_host) {
             err = clEnqueueCopyBuffer(ctx.cmd_queue, ((device_handle *)c.src)->mem, ((device_handle *)c.dst)->mem,
