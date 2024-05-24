@@ -939,13 +939,13 @@ public:
 
     /** Get the number of references to the device memory this buffer is pointing to.
      * Returns 0 if no device memory is associated with the buffer. */
-    int deviceReferenceCount() {
+    int device_reference_count() const {
         return dev_ref_count ? dev_ref_count->count.load() : 0;
     }
 
     /** Get the number of references to the hist memory this buffer is pointing to.
      * Returns 0 if no host memory is associated with the buffer. */
-    int hostReferenceCount() {
+    int host_reference_count() const {
         return alloc ? alloc->ref_count.load() : 0;
     }
 
