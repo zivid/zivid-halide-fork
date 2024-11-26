@@ -755,6 +755,8 @@ WEAK int halide_opencl_initialize_kernels(void *user_context, void **state_ptr, 
 
     debug(user_context) << "halide_cuda_initialize_kernels got compilation_cache mutex.\n";
     cl_program program;
+    debug(user_context) << "compiling kernel\n" << src << "\n";
+    debug(user_context) << &compilation_cache << "\n";
     if (!compilation_cache.kernel_state_setup(user_context, state_ptr, ctx.context, program,
                                               compile_kernel, user_context, ctx.context, src, size)) {
         return halide_error_code_generic_error;

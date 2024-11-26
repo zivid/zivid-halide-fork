@@ -181,18 +181,25 @@ public:
                                                    Args... args) {
         ScopedMutexLock lock_guard(&mutex);
 
+        debug(user_context) << "Running kernel_state_setup\n";
+
         uint32_t *id_ptr = (uint32_t *)state_ptr;
         if (*id_ptr == 0) {
             *id_ptr = unique_id++;
         }
+        debug(user_context) << "id_ptr " << *id_ptr << "\n";
 
         ModuleStateT *mod;
+        debug(user_context) << "Searching cached kernel\n";
         if (find_internal(context, *id_ptr, mod, 1)) {
             result = *mod;
+            debug(user_context) << "Found cached kernel\n";
             return true;
         }
 
         // TODO(zvookin): figure out the calling signature here...
+        debug(user_context) << "Compiling kernel\n";
+
         ModuleStateT compiled_module = f(args...);
         debug(user_context) << "Caching compiled kernel: " << compiled_module
                             << " id " << *id_ptr << " context " << context << "\n";
