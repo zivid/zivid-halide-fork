@@ -279,6 +279,8 @@ public:
     }
 
     ALWAYS_INLINE ~ClContext() {
+        debug(user_context) << "Clearing ClContext\n";
+
         halide_release_cl_context(user_context);
     }
 };
@@ -765,6 +767,7 @@ WEAK int halide_opencl_initialize_kernels(void *user_context, void **state_ptr, 
     cl_program program;
     debug(user_context) << "compiling kernel\n" << src << "\n";
     debug(user_context) << "compilation cache ptr: " << &compilation_cache << "\n";
+    debug(user_context) << "cl context: " << ctx.context << "\n";
     if (!compilation_cache.kernel_state_setup(user_context, state_ptr, ctx.context, program,
                                               compile_kernel, user_context, ctx.context, src, size)) {
         return halide_error_code_generic_error;
