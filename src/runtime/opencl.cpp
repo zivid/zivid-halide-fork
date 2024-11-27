@@ -280,6 +280,14 @@ public:
 
     ALWAYS_INLINE ~ClContext() {
         debug(user_context) << "Clearing ClContext\n";
+        if(!context)
+        {
+            debug(user_context) << "OpenCL: null context\n";
+        }
+        else 
+        {
+            debug(user_context) << "OpenCL: releasing context\n";
+        }
 
         halide_release_cl_context(user_context);
     }
