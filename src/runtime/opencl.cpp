@@ -561,6 +561,9 @@ WEAK cl_program compile_kernel(void *user_context, cl_context ctx, const char *s
     cl_int err = 0;
     cl_device_id dev;
 
+    debug(user_context) << "Compiling kernel:\n" << src << "\n";
+
+    debug(user_context) << "Calling clGetContextInfo\n";
     err = clGetContextInfo(ctx, CL_CONTEXT_DEVICES, sizeof(dev), &dev, nullptr);
     if (err != CL_SUCCESS) {
         error(user_context) << "CL: clGetContextInfo(CL_CONTEXT_DEVICES) failed: "
@@ -572,14 +575,17 @@ WEAK cl_program compile_kernel(void *user_context, cl_context ctx, const char *s
 
     // Get the max constant buffer size supported by this OpenCL implementation.
     cl_ulong max_constant_buffer_size = 0;
+    debug(user_context) << "Calling clGetDeviceInfo for max buffer size\n";
     err = clGetDeviceInfo(dev, CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE, sizeof(max_constant_buffer_size), &max_constant_buffer_size, nullptr);
     if (err != CL_SUCCESS) {
         error(user_context) << "CL: clGetDeviceInfo (CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE) failed: "
                             << get_opencl_error_name(err);
         return nullptr;
     }
+
     // Get the max number of constant arguments supported by this OpenCL implementation.
     cl_uint max_constant_args = 0;
+    debug(user_context) << "Calling clGetDeviceInfo for max constant arguments\n";
     err = clGetDeviceInfo(dev, CL_DEVICE_MAX_CONSTANT_ARGS, sizeof(max_constant_args), &max_constant_args, nullptr);
     if (err != CL_SUCCESS) {
         error(user_context) << "CL: clGetDeviceInfo (CL_DEVICE_MAX_CONSTANT_ARGS) failed: "
@@ -598,6 +604,7 @@ WEAK cl_program compile_kernel(void *user_context, cl_context ctx, const char *s
     const char *sources[] = {src};
     debug(user_context) << "    clCreateProgramWithSource -> ";
     cl_program program = clCreateProgramWithSource(ctx, 1, &sources[0], nullptr, &err);
+    debug(user_context) << "created cl_program\n";
     if (err != CL_SUCCESS) {
         debug(user_context) << get_opencl_error_name(err) << "\n";
         error(user_context) << "CL: clCreateProgramWithSource failed: "
@@ -631,6 +638,7 @@ WEAK cl_program compile_kernel(void *user_context, cl_context ctx, const char *s
 
         return nullptr;
     }
+    debug(user_context) << "Successfully done clBuildProgram\n";
     return program;
 }
 
@@ -756,7 +764,7 @@ WEAK int halide_opencl_initialize_kernels(void *user_context, void **state_ptr, 
     debug(user_context) << "halide_cuda_initialize_kernels got compilation_cache mutex.\n";
     cl_program program;
     debug(user_context) << "compiling kernel\n" << src << "\n";
-    debug(user_context) << &compilation_cache << "\n";
+    debug(user_context) << "compilation cache ptr: " << &compilation_cache << "\n";
     if (!compilation_cache.kernel_state_setup(user_context, state_ptr, ctx.context, program,
                                               compile_kernel, user_context, ctx.context, src, size)) {
         return halide_error_code_generic_error;
