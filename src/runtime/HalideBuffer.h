@@ -771,6 +771,90 @@ public:
         copy_shape_from(other.buf);
     }
 
+    /** Check if a buffer can be safely reinterpreted into
+     * another type and dimensionality.
+     */
+    template<typename T2, int D2>
+    bool can_reinterpret_to(const std::array<int, D2> &sizes) const {
+        static_assert(!T_is_void && !std::is_same_v<T2, void>, "Cannot reinterpret void Buffers.");
+        static_assert(alignof(T2) <= alignof(T), "Cannot ensure alignment when requirements increase.");
+        static_assert(std::is_fundamental_v<T> && std::is_fundamental_v<T2>,
+                      "Can only reinterpret between fundamental types.");
+
+        const auto bytesInThis = this->number_of_elements() * sizeof(T);
+        auto requestedBytes = sizeof(T2);
+        for (const auto s : sizes) {
+            requestedBytes *= s;
+        }
+
+        return bytesInThis >= requestedBytes;
+    }
+
+    static void zivid_halide_assert(const bool passed, const std::string &msg) {
+        if (!passed) {
+            throw std::runtime_error(msg);
+        }
+    }
+
+    /** Reinterpret a Buffer into another type and dimension.
+     *  Performs runtime check on the buffer size to make sure it fits.
+     *  It should be perfectly safe to use this function in any scenario,
+     *  the checks should catch any misuse and potential issue.
+     */
+    template<typename T2, int D2>
+    Buffer<T2, D2, D2> reinterpret(const std::array<int, D2> &sizes) const {
+        // Dirty hack to enforce GPU ref counter allocation.
+        // Halide uses it too, so it should be fine.
+        {
+            auto that = *this;
+        }
+
+        zivid_halide_assert(
+            buf.device != 0 && buf.host == nullptr &&
+                dev_ref_count != nullptr && alloc == nullptr &&
+                buf.padding == nullptr && buf.flags == 0,
+            "Expected Buffer with device but not host allocation.");
+
+        const auto canBeReinterpreted = this->can_reinterpret_to<T2, D2>(sizes);
+        zivid_halide_assert(canBeReinterpreted, "Cannot reinterpret Buffer to different size.");
+
+        Buffer<T2, D2, D2> reinterpretedBuffer;
+
+        // Sanity checks that ensure the implementation didn't change since this was added.
+        // If any of them fails that means we need to update this function.
+        zivid_halide_assert(
+            reinterpretedBuffer.buf.padding == nullptr &&
+                reinterpretedBuffer.buf.device == 0 &&
+                reinterpretedBuffer.buf.dim == reinterpretedBuffer.shape &&
+                reinterpretedBuffer.buf.host == nullptr &&
+                reinterpretedBuffer.alloc == nullptr &&
+                reinterpretedBuffer.buf.flags == 0,
+            "Failed sanity check, consider fixing this code.");
+
+        this->incref();
+        reinterpretedBuffer.dev_ref_count = dev_ref_count;
+        reinterpretedBuffer.buf.device = buf.device;
+        reinterpretedBuffer.buf.device_interface = buf.device_interface;
+
+        int stride = 1;
+        for (int i = 0; i < D2; ++i) {
+            const auto s = sizes[i];
+
+            auto &dim = reinterpretedBuffer.buf.dim[i];
+
+            dim.min = 0;
+            dim.extent = s;
+            dim.stride = stride;
+
+            stride *= s;
+        }
+
+        zivid_halide_assert(
+            stride == reinterpretedBuffer.number_of_elements(), "Total stride mismatched number of elements.");
+
+        return reinterpretedBuffer;
+    }
+
     /** Construct a Buffer from a Buffer of different dimensionality
      * and type. Asserts that the type and dimensionality matches (at runtime,
      * if one of the types is void). Note that this constructor is
@@ -2071,9 +2155,8 @@ private:
     }
 
     template<typename... Args>
-    HALIDE_ALWAYS_INLINE
-        storage_T *
-        address_of(Args... args) const {
+    HALIDE_ALWAYS_INLINE storage_T *
+    address_of(Args... args) const {
         if (T_is_void) {
             return (storage_T *)(this->buf.host) + offset_of(0, args...) * type().bytes();
         } else {
@@ -2149,9 +2232,8 @@ public:
 
     template<typename... Args,
              typename = typename std::enable_if<AllInts<Args...>::value>::type>
-    HALIDE_ALWAYS_INLINE
-        not_void_T &
-        operator()(int first, Args... rest) {
+    HALIDE_ALWAYS_INLINE not_void_T &
+    operator()(int first, Args... rest) {
         static_assert(!T_is_void,
                       "Cannot use operator() on Buffer<void> types");
         constexpr int expected_dims = 1 + (int)(sizeof...(rest));
