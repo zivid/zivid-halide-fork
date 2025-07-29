@@ -97,7 +97,7 @@ endif
 # python-config.
 PY_EXT = $(shell $(PYTHON) -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')
 PY_MODEL_EXT = model_cpp$(PY_EXT)
-PYCXXFLAGS = $(PYBIND11_CFLAGS) $(CXXFLAGS) -Wno-deprecated-register
+PYCXXFLAGS = $(PYBIND11_CFLAGS) $(CXXFLAGS) -Wno-deprecated-register -isystem /usr/include/python3.13
 
 # Python extension for HalideModel
 $(BIN)/%/$(PY_MODEL_EXT): model.cpp $(BIN)/%/oclib.a

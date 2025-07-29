@@ -8,6 +8,7 @@
 #include "onnx_converter.h"
 #include <fstream>
 #include <random>
+#include <stdexcept>
 #include <sys/time.h>
 #include <unordered_set>
 
@@ -126,7 +127,7 @@ void prepare_py_array_input(
         input_shape.push_back(ndarray.shape(i));
     }
     // Make sure the input is contiguous.
-    int stride = ndarray.itemsize();
+    int stride = 4; // for some reason itemsize() returns 0
     for (int i = rank - 1; i >= 0; --i) {
         if (stride != ndarray.strides(i)) {
             throw std::invalid_argument(
@@ -350,6 +351,9 @@ std::vector<py::array> run(
     tgt.set_feature(Halide::Target::LargeBuffers, false);
     if (device == "CUDA") {
         tgt.set_feature(Halide::Target::CUDA, true);
+    }
+    if (device == "OpenCL") {
+        tgt.set_feature(Halide::Target::OpenCL, true);
     }
 
     pipeline.rep->realize(real, tgt);

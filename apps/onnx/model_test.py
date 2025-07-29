@@ -1,7 +1,10 @@
 import unittest
+
 from model import Model
 from onnx import helper
 from onnx import TensorProto
+from onnx import load
+
 import numpy as np
 
 
@@ -115,3 +118,14 @@ class ModelTest(unittest.TestCase):
         outputs = model.run([input_data])
         self.assertEqual(6, outputs[0])
         self.assertAlmostEqual(3.14, outputs[1])
+
+    def test_onnx_model_from_file(self):
+        onnx_model_path = "/home/vaibhav/zivid/zivid-sdk/vision-machine-learning/workspace/onnx/robocolor_denoise.onnx"
+        onnx_model = load(onnx_model_path)
+
+        model = Model()
+        model.BuildFromOnnxModel(onnx_model)
+        
+        input_data = np.random.rand(1, 3, 502, 502).astype(np.float32)
+        outputs = model.run([input_data])
+        self.assertEqual(1, len(outputs))

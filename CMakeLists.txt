@@ -118,6 +118,8 @@ else ()
     set(Halide_ANY_SANITIZERS_ENABLED 0)
 endif ()
 
+add_compile_options("-g")
+
 # Helper function to set C++ compiler warnings in a sane way
 function(set_halide_compiler_warnings NAME)
     target_compile_options(
