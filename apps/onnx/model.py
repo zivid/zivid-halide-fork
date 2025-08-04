@@ -28,10 +28,10 @@ class Model:
                 model_str, expected_dim_sizes, layout
             )
 
-    def OptimizeSchedule(self):
+    def OptimizeSchedule(self, device=''):
         if not self.pipeline:
             raise Exception("model not initialized, call BuildFromOnnxModel first")
-        return model_cpp.AutoSchedule(self.pipeline)
+        return model_cpp.AutoSchedule(self.pipeline, device)
 
     def run(self, inputs, device=""):
         if not self.pipeline:
@@ -43,10 +43,10 @@ class Model:
             raise Exception("model not initialized, call BuildFromOnnxModel first")
         return model_cpp.Benchmark(self.pipeline, num_iters, device)
 
-    def Compile(self, func_name, lib_name):
+    def Compile(self, func_name, lib_name, device=''):
         if not self.pipeline:
             raise Exception("model not initialized, call BuildFromOnnxModel first")
-        return model_cpp.Compile(self.pipeline, func_name, lib_name)
+        return model_cpp.Compile(self.pipeline, func_name, lib_name, device)
 
     def PrintLoopNest(self):
         if not self.pipeline:

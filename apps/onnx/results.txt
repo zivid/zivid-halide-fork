@@ -1,0 +1,61 @@
+CPU, adams2019 scheduler:
+
+Running zivid robocolor denoise model test...
+Input shape: 1x3x2848x2848
+Running Warmup ...
+Warmup completed.
+Running inference...
+Inference completed in 2846 ms
+Success!
+
+GPU, li2018 scheduler (intel iGPU):
+
+Running zivid robocolor denoise model test...
+Input shape: 1x3x2848x2848
+Running Warmup ...
+Warmup completed.
+Running inference...
+Inference completed in 12530 ms
+Success!
+
+CUDA fails with CUDA_ERROR_OUT_OF_MEMORY
+
+GPU, Mullapudi2016 scheduler (intel iGPU):
+
+Running zivid robocolor denoise model test...
+Input shape: 1x3x2848x2848
+Running Warmup ...
+Warmup completed.
+Running inference...
+Inference completed in 5254 ms
+Success!
+
+CUDA:
+
+Running zivid robocolor denoise model test...
+Input shape: 1x3x2848x2848
+Running Warmup ...
+Warmup completed.
+Running inference...
+Inference completed in 5196 ms
+Success!
+
+GPU Anderson2021 (intel iGPU):
+
+Crashes with Error: OpenCL error: CL_INVALID_WORK_GROUP_SIZE clEnqueueNDRangeKernel failed
+
+Error: CUDA error: CUDA_ERROR_OUT_OF_MEMORY cuMemAlloc failed
+
+
+-------------------------------------
+
+OpenCL with Mullapudi2016 scheduler (intel iGPU):
+
+Benchmark for zivid_robocolor_denoise_model produces best case of 5.62779 sec/iter (over 3 samples, 3 iterations, accuracy 2.2%).
+Best output throughput is 5.1e-07 mpix/sec.
+
+
+CUDA with Mullapudi2016 scheduler (Nvidia RTX 3050):
+
+Benchmark for zivid_robocolor_denoise_model produces best case of 5.70393 sec/iter (over 3 samples, 3 iterations, accuracy 0.69%).
+Best output throughput is 5e-07 mpix/sec.

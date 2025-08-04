@@ -63,10 +63,30 @@ HalideModel convert_onnx_model(
     return result;
 }
 
-std::string auto_schedule(const HalideModel &pipeline) {
+Halide::Target get_halide_target(const std::string &device) {
+    Halide::Target target = Halide::get_host_target();
+    if (device == "CUDA") {
+        target.set_feature(Halide::Target::CUDA, true);
+        target.set_feature(Halide::Target::CUDACapability86, true);
+    }
+    if (device == "OpenCL") {
+        target.set_feature(Halide::Target::OpenCL, true);
+    }
+    return target;
+}
+
+Halide::AutoschedulerParams get_auto_scheduler(const std::string &device) {
+    if (device == "CUDA" || device == "OpenCL") {
+        // Lii2018 is the only auto scheduler that supports GPU
+        return Halide::AutoschedulerParams("Li2018");
+    }
+    return Halide::AutoschedulerParams("Adams2019");
+}
+
+std::string auto_schedule(const HalideModel &pipeline, const std::string &device) {
     // Generate a schedule for the pipeline.
-    Halide::Target tgt = Halide::get_host_target();
-    Halide::AutoschedulerParams autoscheduler_params = Halide::AutoschedulerParams("Adams2019");
+    Halide::Target tgt = get_halide_target(device);
+    Halide::AutoschedulerParams autoscheduler_params = get_auto_scheduler(device);
     auto schedule = pipeline.rep->apply_autoscheduler(tgt, autoscheduler_params);
     return schedule.schedule_source;
 }
@@ -345,18 +365,17 @@ std::vector<py::array> run(
         outputs[i].transpose(dims);
     }
     Halide::Realization real(outputs);
-    Halide::Target tgt = Halide::get_host_target();
+    Halide::Target tgt = get_halide_target(device);
     // Don't create buffers larger than 2GB since we use 32bit signed indices to
     // index the data stored in them.
     tgt.set_feature(Halide::Target::LargeBuffers, false);
-    if (device == "CUDA") {
-        tgt.set_feature(Halide::Target::CUDA, true);
-    }
-    if (device == "OpenCL") {
-        tgt.set_feature(Halide::Target::OpenCL, true);
-    }
 
-    pipeline.rep->realize(real, tgt);
+    try {
+        pipeline.rep->realize(real, tgt);
+    } catch (const std::exception &e) {
+        throw std::runtime_error(
+            "Failed to run the model: " + std::string(e.what()));
+    }
 
     std::vector<py::array> results;
 
@@ -463,13 +482,10 @@ double benchmark(
     }
 
     Halide::Realization real(outputs);
-    Halide::Target tgt = Halide::get_host_target();
+    Halide::Target tgt = get_halide_target(device);
     // Don't create buffers larger than 2GB since we use 32bit signed indices to
     // index the data stored in them.
     tgt.set_feature(Halide::Target::LargeBuffers, false);
-    if (device == "CUDA") {
-        tgt.set_feature(Halide::Target::CUDA, true);
-    }
     pipeline.rep->realize(real, tgt);
 
     // Now benchmark by computing the value of the outputs num_iter times
@@ -506,12 +522,13 @@ double benchmark(
 void compile(
     const HalideModel &pipeline,
     const std::string &func_name,
-    const std::string &lib_name) {
+    const std::string &lib_name,
+    const std::string &device) {
     std::vector<Halide::Argument> inputs;
     for (const std::string &input_name : pipeline.input_names) {
         inputs.push_back(pipeline.model->inputs.at(input_name));
     }
-    Halide::Target tgt = Halide::get_host_target();
+    Halide::Target tgt = get_halide_target(device);
     // tgt.set_feature(Halide::Target::Debug, true);
     // tgt.set_feature(Halide::Target::NoBoundsQuery, true);
     // tgt.set_feature(Halide::Target::TracePipeline, true);
@@ -547,7 +564,7 @@ void print_lowered_statement(const HalideModel &pipeline) {
 }  // namespace
 
 PYBIND11_MODULE(model_cpp, m) {
-    py::class_<HalideModel>(m, "HalideModel");
+    py::class_<HalideModel> onnx_wrapper(m, "HalideModel");
 
     py::enum_<IOLayout>(m, "Layout")
         .value("Native", IOLayout::Native)

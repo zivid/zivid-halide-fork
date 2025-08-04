@@ -1,4 +1,6 @@
 import unittest
+from datetime import datetime
+import logging
 
 from model import Model
 from onnx import helper
@@ -7,6 +9,8 @@ from onnx import load
 
 import numpy as np
 
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 class ModelTest(unittest.TestCase):
     def setUp(self):
@@ -125,7 +129,24 @@ class ModelTest(unittest.TestCase):
 
         model = Model()
         model.BuildFromOnnxModel(onnx_model)
+        device = "CUDA"
+
+        print(f"Optimizing schedule for model", flush=True)
+        time_start = datetime.now()
+        schedule = model.OptimizeSchedule(device=device)
+        time_end = datetime.now()
+        print(f"Schedule optimization time: {(time_end.microsecond - time_start.microsecond)//1_000:.4f} ms")
         
         input_data = np.random.rand(1, 3, 502, 502).astype(np.float32)
-        outputs = model.run([input_data])
+
+        print("Warmup")
+        outputs = model.run([input_data], device=device)
+
+        print(f"Running model with input shape: {input_data.shape} on device: {device}", flush=True)
+        time_start = datetime.now()
+        outputs = model.run([input_data], device=device)
+        time_end = datetime.now()
+        print("Start time:", time_start)
+        print("End time:", time_end)
+        print(f"Model run time: {(time_end - time_start).total_seconds()*1_000:.4f} ms")
         self.assertEqual(1, len(outputs))

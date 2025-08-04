@@ -95,7 +95,7 @@ find_package(pybind11 REQUIRED)
 pybind11_add_module(model_cpp model.cpp)
 target_link_libraries(model_cpp PRIVATE Halide::Halide oclib)
 target_compile_options(model_cpp PRIVATE -g -fPIC -frtti)
-target_link_libraries(model_cpp PRIVATE -Wl,--no-as-needed Halide::Adams2019 -Wl,--as-needed)
+target_link_libraries(model_cpp PRIVATE -Wl,--no-as-needed Halide::Adams2019 Halide::Li2018 Halide::Anderson2021 Halide::Mullapudi2016 -Wl,--as-needed)
 
 # Test python bindings
 add_test(NAME model_test
@@ -119,16 +119,27 @@ set_tests_properties(model_test PROPERTIES
 
 
 # Compile zivid robocolor denoise onnx model to halide model
-set(zivid_robocolor_denoise_model_path /home/vaibhav/zivid/zivid-sdk/vision-machine-learning/workspace/onnx/robocolor_denoise.onnx)
-add_halide_library(zivid_robocolor_denoise_model STMT_HTML 
+find_package(OpenCL REQUIRED)
+set(zivid_robocolor_denoise_model_path /home/vaibhav/zivid/zivid-sdk/vision-machine-learning/workspace/onnx/robocolor_denoise_dynamic.onnx)
+add_halide_library(zivid_robocolor_denoise_model 
                    FROM onnx_converter.generator
                    GENERATOR onnx_model_generator
-                   FEATURES debug
+                   # FEATURES cuda cuda_capability_86 strict_float debug
+		           FEATURES opencl strict_float debug
+                   # AUTOSCHEDULER Halide::Li2018
                    # AUTOSCHEDULER Halide::Adams2019
-                   PARAMS model_file_path=${zivid_robocolor_denoise_model_path})
+		           # AUTOSCHEDULER Halide::Anderson2021
+		           AUTOSCHEDULER Halide::Mullapudi2016
+                   STMT_HTML ON
+                   PARAMS model_file_path=${zivid_robocolor_denoise_model_path} autoscheduler.experimental_gpu_schedule=1
+                   REGISTRATION zivid_robocolor_registration_file)
+target_sources(zivid_robocolor_denoise_model PRIVATE ${zivid_robocolor_denoise_model_path})
+
+add_executable(zivid_robocolor_denoise_model_reg ${zivid_robocolor_registration_file})
+target_link_libraries(zivid_robocolor_denoise_model_reg PRIVATE zivid_robocolor_denoise_model Halide::RunGenMain)
 
 add_executable(zivid_robocolor_denoise_test zivid_robocolor_denoise_test.cc)
-target_link_libraries(zivid_robocolor_denoise_test PRIVATE Halide::Runtime zivid_robocolor_denoise_model)
+target_link_libraries(zivid_robocolor_denoise_test PRIVATE Halide::Runtime zivid_robocolor_denoise_model OpenCL::OpenCL)
 add_test(NAME zivid_robocolor_denoise_test COMMAND zivid_robocolor_denoise_test)
 set_tests_properties(zivid_robocolor_denoise_test PROPERTIES
                      LABELS onnx
