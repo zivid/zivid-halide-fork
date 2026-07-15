@@ -529,7 +529,10 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::visit(const IntImm *imm) {
 }
 
 void CodeGen_Vulkan_Dev::SPIRV_Emitter::visit(const UIntImm *imm) {
-    if (imm->type.bits() == 8) {
+    if (imm->type.bits() == 1) {
+        SpvId constant_id = builder.declare_bool_constant(imm->value != 0);
+        builder.update_id(constant_id);
+    } else if (imm->type.bits() == 8) {
         declare_constant_uint<uint8_t>(imm->type, imm->value);
     } else if (imm->type.bits() == 16) {
         declare_constant_uint<uint16_t>(imm->type, imm->value);
@@ -575,9 +578,8 @@ SpvId CodeGen_Vulkan_Dev::SPIRV_Emitter::convert_to_bool(Type target_type, Type 
     debug(2) << "CodeGen_Vulkan_Dev::SPIRV_Emitter::convert_to_bool(): casting from value type '"
              << value_type << "' to target type '" << target_type << "' for value id '" << value_id << "' !\n";
 
-    if (!value_type.is_bool()) {
-        value_id = cast_type(Bool(), value_type, value_id);
-    }
+    internal_assert(value_type.is_bool()) << "CodeGen_Vulkan_Dev::SPIRV_Emitter::convert_to_bool(): "
+                                          << "value type must be bool, got " << value_type << "\n";
 
     const int true_value = 1;
     const int false_value = 0;
@@ -631,12 +633,48 @@ SpvId CodeGen_Vulkan_Dev::SPIRV_Emitter::cast_type(Type target_type, Type value_
         return value_id;
     }
 
+    if (target_type.is_bool() && !value_type.is_bool()) {
+        // Match the semantics of CodeGen_LLVM ... numeric to bool casts truncate
+        // the value to the lowest bit. Floats are first converted to uint8 (as
+        // is done in CodeGen_LLVM to avoid undefined behavior for out of range
+        // values). Since SPIR-V bools don't have a numeric representation, the
+        // lowest bit is extracted with a bitwise-and and compared against zero.
+        Type int_type = value_type;
+        SpvId int_value_id = value_id;
+        if (value_type.is_float()) {
+            int_type = UInt(8, value_type.lanes());
+            int_value_id = cast_type(int_type, value_type, value_id);
+        }
+
+        std::vector<uint8_t> one_data(int_type.bytes() * int_type.lanes(), (uint8_t)0);
+        if (int_type.bits() == 8) {
+            fill_bytes_with_value<uint8_t>(&one_data[0], int_type.lanes(), 1);
+        } else if (int_type.bits() == 16) {
+            fill_bytes_with_value<uint16_t>(&one_data[0], int_type.lanes(), 1);
+        } else if (int_type.bits() == 32) {
+            fill_bytes_with_value<uint32_t>(&one_data[0], int_type.lanes(), 1);
+        } else if (int_type.bits() == 64) {
+            fill_bytes_with_value<uint64_t>(&one_data[0], int_type.lanes(), 1);
+        } else {
+            user_error << "Unhandled type cast from value type '" << value_type << "' to target type '" << target_type << "'!";
+        }
+
+        SpvId int_type_id = builder.declare_type(int_type);
+        SpvId one_id = builder.declare_constant(int_type, &one_data[0]);
+        SpvId masked_id = builder.reserve_id(SpvResultId);
+        builder.append(SpvFactory::binary_op(SpvOpBitwiseAnd, int_type_id, masked_id, int_value_id, one_id));
+
+        SpvId bool_type_id = builder.declare_type(target_type);
+        SpvId zero_id = builder.declare_null_constant(int_type);
+        SpvId result_id = builder.reserve_id(SpvResultId);
+        builder.append(SpvFactory::binary_op(SpvOpINotEqual, bool_type_id, result_id, masked_id, zero_id));
+        return result_id;
+    }
+
     SpvOp op_code = SpvOpNop;
     if (value_type.is_float()) {
         if (target_type.is_float()) {
             op_code = SpvOpFConvert;
-        } else if (target_type.is_bool()) {
-            op_code = SpvOpSelect;
         } else if (target_type.is_uint()) {
             op_code = SpvOpConvertFToU;
         } else if (target_type.is_int()) {
@@ -647,16 +685,12 @@ SpvId CodeGen_Vulkan_Dev::SPIRV_Emitter::cast_type(Type target_type, Type value_
     } else if (value_type.is_uint()) {
         if (target_type.is_float()) {
             op_code = SpvOpConvertUToF;
-        } else if (target_type.is_bool()) {
-            op_code = SpvOpSelect;
         } else if (target_type.is_int_or_uint()) {
             op_code = SpvOpUConvert;
         }
     } else if (value_type.is_int()) {
         if (target_type.is_float()) {
             op_code = SpvOpConvertSToF;
-        } else if (target_type.is_bool()) {
-            op_code = SpvOpSelect;
         } else if (target_type.is_int_or_uint()) {
             op_code = SpvOpSConvert;
         }
@@ -815,6 +849,11 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::visit(const Mod *op) {
 
 void CodeGen_Vulkan_Dev::SPIRV_Emitter::visit(const Max *op) {
     debug(2) << "CodeGen_Vulkan_Dev::SPIRV_Emitter::visit(Max): " << op->type << " Max((" << op->a << "), (" << op->b << "))\n";
+    if (op->type.is_bool()) {
+        // SPIR-V has no integer min/max for bools ... max is equivalent to logical-or
+        visit_binary_op(SpvOpLogicalOr, op->type, op->a, op->b);
+        return;
+    }
     SpvId op_code = SpvOpNop;
     if (op->type.is_float()) {
         op_code = GLSLstd450FMax;
@@ -850,6 +889,11 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::visit(const Max *op) {
 
 void CodeGen_Vulkan_Dev::SPIRV_Emitter::visit(const Min *op) {
     debug(2) << "CodeGen_Vulkan_Dev::SPIRV_Emitter::visit(Min): " << op->type << " Min((" << op->a << "), (" << op->b << "))\n";
+    if (op->type.is_bool()) {
+        // SPIR-V has no integer min/max for bools ... min is equivalent to logical-and
+        visit_binary_op(SpvOpLogicalAnd, op->type, op->a, op->b);
+        return;
+    }
     SpvId op_code = SpvOpNop;
     if (op->type.is_float()) {
         op_code = GLSLstd450FMin;
@@ -891,6 +935,8 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::visit(const EQ *op) {
     SpvOp op_code = SpvOpNop;
     if (op->a.type().is_float()) {
         op_code = SpvOpFOrdEqual;
+    } else if (op->a.type().is_bool()) {
+        op_code = SpvOpLogicalEqual;
     } else {
         op_code = SpvOpIEqual;
     }
@@ -911,6 +957,8 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::visit(const NE *op) {
     SpvOp op_code = SpvOpNop;
     if (op->a.type().is_float()) {
         op_code = SpvOpFOrdNotEqual;
+    } else if (op->a.type().is_bool()) {
+        op_code = SpvOpLogicalNotEqual;
     } else {
         op_code = SpvOpINotEqual;
     }
@@ -928,6 +976,15 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::visit(const LT *op) {
     debug(2) << "CodeGen_Vulkan_Dev::SPIRV_Emitter::visit(LT): " << op->type << " (" << op->a << ") < (" << op->b << ")\n";
     if (op->a.type() != op->b.type()) {
         internal_error << "CodeGen_Vulkan_Dev::SPIRV_Emitter::visit(const LT *op): Mismatched operand types: " << op->a.type() << " != " << op->b.type() << "\n";
+    }
+    if (op->a.type().is_bool()) {
+        // SPIR-V integer comparisons don't accept bools ... a < b is equivalent to !a && b
+        Expr equiv = And::make(Not::make(op->a), op->b);
+        if (!op->type.is_bool()) {
+            equiv = Cast::make(op->type, equiv);
+        }
+        equiv.accept(this);
+        return;
     }
     SpvOp op_code = SpvOpNop;
     if (op->a.type().is_float()) {
@@ -954,6 +1011,15 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::visit(const LE *op) {
     if (op->a.type() != op->b.type()) {
         internal_error << "CodeGen_Vulkan_Dev::SPIRV_Emitter::visit(const LE *op): Mismatched operand types: " << op->a.type() << " != " << op->b.type() << "\n";
     }
+    if (op->a.type().is_bool()) {
+        // SPIR-V integer comparisons don't accept bools ... a <= b is equivalent to !a || b
+        Expr equiv = Or::make(Not::make(op->a), op->b);
+        if (!op->type.is_bool()) {
+            equiv = Cast::make(op->type, equiv);
+        }
+        equiv.accept(this);
+        return;
+    }
     SpvOp op_code = SpvOpNop;
     if (op->a.type().is_float()) {
         op_code = SpvOpFOrdLessThanEqual;
@@ -979,6 +1045,15 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::visit(const GT *op) {
     if (op->a.type() != op->b.type()) {
         internal_error << "CodeGen_Vulkan_Dev::SPIRV_Emitter::visit(const GT *op): Mismatched operand types: " << op->a.type() << " != " << op->b.type() << "\n";
     }
+    if (op->a.type().is_bool()) {
+        // SPIR-V integer comparisons don't accept bools ... a > b is equivalent to a && !b
+        Expr equiv = And::make(op->a, Not::make(op->b));
+        if (!op->type.is_bool()) {
+            equiv = Cast::make(op->type, equiv);
+        }
+        equiv.accept(this);
+        return;
+    }
     SpvOp op_code = SpvOpNop;
     if (op->a.type().is_float()) {
         op_code = SpvOpFOrdGreaterThan;
@@ -1003,6 +1078,15 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::visit(const GE *op) {
     debug(2) << "CodeGen_Vulkan_Dev::SPIRV_Emitter::visit(GE): " << op->type << " (" << op->a << ") >= (" << op->b << ")\n";
     if (op->a.type() != op->b.type()) {
         internal_error << "CodeGen_Vulkan_Dev::SPIRV_Emitter::visit(const LE *op): Mismatched operand types: " << op->a.type() << " != " << op->b.type() << "\n";
+    }
+    if (op->a.type().is_bool()) {
+        // SPIR-V integer comparisons don't accept bools ... a >= b is equivalent to a || !b
+        Expr equiv = Or::make(op->a, Not::make(op->b));
+        if (!op->type.is_bool()) {
+            equiv = Cast::make(op->type, equiv);
+        }
+        equiv.accept(this);
+        return;
     }
     SpvOp op_code = SpvOpNop;
     if (op->a.type().is_float()) {
@@ -1113,16 +1197,17 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::visit(const Call *op) {
         }
     } else if (op->is_intrinsic(Call::bitwise_and)) {
         internal_assert(op->args.size() == 2);
-        visit_binary_op(SpvOpBitwiseAnd, op->type, op->args[0], op->args[1]);
+        // SPIR-V bitwise ops don't accept bools ... use the equivalent logical op
+        visit_binary_op(op->type.is_bool() ? SpvOpLogicalAnd : SpvOpBitwiseAnd, op->type, op->args[0], op->args[1]);
     } else if (op->is_intrinsic(Call::bitwise_xor)) {
         internal_assert(op->args.size() == 2);
-        visit_binary_op(SpvOpBitwiseXor, op->type, op->args[0], op->args[1]);
+        visit_binary_op(op->type.is_bool() ? SpvOpLogicalNotEqual : SpvOpBitwiseXor, op->type, op->args[0], op->args[1]);
     } else if (op->is_intrinsic(Call::bitwise_or)) {
         internal_assert(op->args.size() == 2);
-        visit_binary_op(SpvOpBitwiseOr, op->type, op->args[0], op->args[1]);
+        visit_binary_op(op->type.is_bool() ? SpvOpLogicalOr : SpvOpBitwiseOr, op->type, op->args[0], op->args[1]);
     } else if (op->is_intrinsic(Call::bitwise_not)) {
         internal_assert(op->args.size() == 1);
-        visit_unary_op(SpvOpNot, op->type, op->args[0]);
+        visit_unary_op(op->type.is_bool() ? SpvOpLogicalNot : SpvOpNot, op->type, op->args[0]);
     } else if (op->is_intrinsic(Call::if_then_else)) {
         Expr cond = op->args[0];
         if (const Broadcast *b = cond.as<Broadcast>()) {
@@ -2637,7 +2722,8 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::declare_device_args(const Stmt &s, uint3
     // (passed as a runtime array)
     for (const auto &arg : args) {
         if (arg.type.is_int_or_uint()) {
-            if (arg.type.bits() == 8) {
+            // bools have no physical representation in SPIR-V and are stored as 8-bit integers
+            if (arg.type.bits() <= 8) {
                 builder.require_extension("SPV_KHR_8bit_storage");
             } else if (arg.type.bits() == 16) {
                 builder.require_extension("SPV_KHR_16bit_storage");
@@ -2654,13 +2740,15 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::declare_device_args(const Stmt &s, uint3
     for (const auto &arg : args) {
         if (!arg.is_buffer) {
             // Add required access capability for smaller bit-width types used as runtime arrays
-            if (arg.type.bits() == 8) {
+            if (arg.type.bits() <= 8) {
                 builder.require_capability(SpvCapabilityUniformAndStorageBuffer8BitAccess);
             } else if (arg.type.bits() == 16) {
                 builder.require_capability(SpvCapabilityUniformAndStorageBuffer16BitAccess);
             }
 
-            SpvId arg_type_id = builder.declare_type(arg.type);
+            // bools have no physical representation in SPIR-V, so pass them as 8-bit integers
+            Type param_type = arg.type.is_bool() ? UInt(8) : arg.type;
+            SpvId arg_type_id = builder.declare_type(param_type);
             param_struct_members.push_back(arg_type_id);
             scalar_arg_count++;
         } else {
@@ -2723,12 +2811,13 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::declare_device_args(const Stmt &s, uint3
         descriptor_set.uniform_buffer_count++;
         binding_counter++;
 
-        // Declare all the scalar args with appropriate offsets into the parameter struct
+        // Declare all the args with appropriate offsets into the parameter struct
         uint32_t scalar_index = 0;
         for (const auto &arg : args) {
             if (!arg.is_buffer) {
 
-                SpvId arg_type_id = builder.declare_type(arg.type);
+                Type param_type = arg.type.is_bool() ? UInt(8) : arg.type;
+                SpvId arg_type_id = builder.declare_type(param_type);
                 SpvId access_index_id = builder.declare_constant(UInt(32), &scalar_index);
                 SpvId pointer_type_id = builder.declare_pointer_type(arg_type_id, SpvStorageClassUniform);
                 SpvFactory::Indices access_indices = {access_index_id};
@@ -2737,6 +2826,9 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::declare_device_args(const Stmt &s, uint3
 
                 SpvId param_id = builder.reserve_id(SpvResultId);
                 builder.append(SpvFactory::load(arg_type_id, param_id, access_chain_id));
+                if (param_type != arg.type) {
+                    param_id = cast_type(arg.type, param_type, param_id);
+                }
                 symbol_table.push(arg.name, {param_id, SpvStorageClassUniform});
             }
         }
@@ -2755,7 +2847,9 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::declare_device_args(const Stmt &s, uint3
             int lanes = check_dense.are_all_dense ? check_dense.lanes : 1;
 
             // Declare the runtime array (which maps directly to the Halide device buffer)
-            Type array_element_type = arg.type.with_lanes(lanes);
+            // bools have no physical representation in SPIR-V, so they are stored as 8-bit integers
+            Type array_storage_type = arg.type.is_bool() ? UInt(8) : arg.type;
+            Type array_element_type = array_storage_type.with_lanes(lanes);
             SpvId array_element_type_id = builder.declare_type(array_element_type);
             SpvId runtime_arr_type_id = builder.add_runtime_array(array_element_type_id);
 
