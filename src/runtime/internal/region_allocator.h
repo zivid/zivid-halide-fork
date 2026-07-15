@@ -483,7 +483,11 @@ BlockRegion *RegionAllocator::split_block_region(void *user_context, BlockRegion
     }
     empty_region->prev_ptr = block_region;
     block_region->next_ptr = empty_region;
-    block_region->memory.allocation.size -= empty_region->memory.allocation.size;
+    // NOTE: Compute the resulting size from the empty region's conformed offset ...
+    // subtracting the empty region's size would shrink this region below the requested
+    // size whenever conforming the empty region adjusted its offset or size
+    block_region->memory.allocation.size = empty_region->memory.allocation.offset - block_region->memory.allocation.offset;
+    halide_abort_if_false(user_context, block_region->memory.allocation.size >= request.size);
     return empty_region;
 }
 
