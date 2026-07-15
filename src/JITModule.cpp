@@ -1182,6 +1182,9 @@ void JITCache::finish_profiling(JITUserContext *context) {
 
 void JITErrorBuffer::concat(const char *message) {
     size_t len = strlen(message);
+    if (len == 0) {
+        return;
+    }
 
     if (len && message[len - 1] != '\n') {
         // Claim some extra space for a newline.
