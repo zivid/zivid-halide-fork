@@ -597,7 +597,9 @@ VkResult vk_create_debug_utils_messenger(void *user_context, VkInstance instance
         create_info.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
         create_info.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
         create_info.pfnUserCallback = vk_debug_utils_messenger_callback;
-        create_info.pUserData = user_context;
+        // NOTE: the messenger outlives this call, so we must not capture the
+        // caller's user_context (a JIT user context may live on the stack).
+        create_info.pUserData = nullptr;
         return func(instance, &create_info, allocator->callbacks(), messenger);
     } else {
         debug(user_context) << "Vulkan: Debug Utils Messenger extension unavailable!\n";
