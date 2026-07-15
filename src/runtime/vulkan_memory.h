@@ -614,7 +614,15 @@ int VulkanMemoryAllocator::conform_block_request(void *instance_ptr, MemoryReque
                    << "dedicated=" << (request->dedicated ? "true" : "false") << ")\n";
 #endif
 
-    request->size = memory_requirements.size;
+    // NOTE: Conform the block size the same way region requests are conformed, so that
+    // a block created for a given request is guaranteed to be able to hold the
+    // conformed region request for the same size
+    size_t actual_alignment = conform_alignment(request->alignment, memory_requirements.alignment);
+    if (actual_alignment > instance->config.nearest_multiple) {
+        request->properties.nearest_multiple = actual_alignment;
+    }
+    size_t actual_offset = aligned_offset(request->offset, actual_alignment);
+    request->size = conform_size(actual_offset, memory_requirements.size, actual_alignment, request->properties.nearest_multiple);
     request->properties.alignment = memory_requirements.alignment;
     return halide_error_code_success;
 }
