@@ -414,6 +414,15 @@ BlockRegion *RegionAllocator::coalesce_block_regions(void *user_context, BlockRe
                             << "into current region (offset=" << (int32_t)block_region->memory.allocation.offset << " size=" << (int32_t)(block_region->memory.allocation.size) << " bytes)!";
 #endif
 
+        if ((prev_region->usage_count == 0) && (prev_region->memory.handle != nullptr)) {
+            // NOTE: The cached allocation was created for the region's current size,
+            // which is about to change ... so it must be released before coalescing
+            halide_abort_if_false(user_context, allocators.region.deallocate != nullptr);
+            MemoryRegion *prev_memory_region = &(prev_region->memory);
+            allocators.region.deallocate(user_context, prev_memory_region);
+            prev_region->memory.handle = nullptr;
+        }
+
         prev_region->next_ptr = block_region->next_ptr;
         if (block_region->next_ptr) {
             block_region->next_ptr->prev_ptr = prev_region;
