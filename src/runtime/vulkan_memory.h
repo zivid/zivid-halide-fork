@@ -1006,12 +1006,17 @@ int VulkanMemoryAllocator::conform(void *user_context, MemoryRequest *request) {
         }
     }
 
+    size_t actual_alignment = conform_alignment(request->alignment, memory_requirements.alignment);
+
     // Ensure the request ends on an aligned address
-    if (request->alignment > config.nearest_multiple) {
-        request->properties.nearest_multiple = request->alignment;
+    // NOTE: Use the conformed alignment (rather than the requested alignment) so that
+    // conforming is idempotent ... otherwise the first pass would compute the size with
+    // the original nearest_multiple, but update the alignment, causing any subsequent
+    // conform of the same request to produce a larger size than the region reserved for it
+    if (actual_alignment > config.nearest_multiple) {
+        request->properties.nearest_multiple = actual_alignment;
     }
 
-    size_t actual_alignment = conform_alignment(request->alignment, memory_requirements.alignment);
     size_t actual_offset = aligned_offset(request->offset, actual_alignment);
     size_t actual_size = conform_size(actual_offset, memory_requirements.size, actual_alignment, request->properties.nearest_multiple);
 
