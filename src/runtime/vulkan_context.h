@@ -271,7 +271,12 @@ int vk_select_device_for_context(void *user_context,
                 matching_device = 1;
             } else if (strstr(dev_type, "virtual-gpu") && (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU)) {
                 matching_device = 1;
-            } else if (strstr(dev_type, "gpu") && ((properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) || (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU))) {
+            } else if (strstr(dev_type, "gpu") &&
+                       !strstr(dev_type, "integrated-gpu") && !strstr(dev_type, "discrete-gpu") && !strstr(dev_type, "virtual-gpu") &&
+                       ((properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) || (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU))) {
+                // NOTE: the plain "gpu" match must not trigger for the specific
+                // "<kind>-gpu" values (all of which contain "gpu"), or the first
+                // enumerated GPU of the wrong kind wins over a later matching one.
                 matching_device = 1;
             }
         } else {
