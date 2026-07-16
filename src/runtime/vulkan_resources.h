@@ -54,6 +54,7 @@ struct VulkanShaderBinding {
     VulkanSharedMemoryAllocation *shared_memory_allocations = nullptr;
     uint32_t bindings_count = 0;
     MemoryRegion *args_region = nullptr;
+    uint64_t submit_serial = 0;
 };
 
 // Compiled shader module and associated bindings
@@ -326,6 +327,88 @@ int vk_release_cached_command_resources(void *user_context, VulkanMemoryAllocato
     return halide_error_code_success;
 }
 
+// Without a blocking wait after each submission, execution of separate command
+// buffers on the same queue may overlap. This barrier orders the commands that
+// follow it after all previously submitted compute/transfer work on the queue.
+// With no submissions in flight there is nothing to order against — and the
+// barrier is not free (on Intel Gen it stalls the pipe and flushes data
+// caches), so it is skipped when the queue is known to be drained.
+void vk_record_ordering_barrier(void *user_context, VkCommandBuffer command_buffer) {
+    if (!vk_use_async_submission() || !vk_queue_has_pending_work()) {
+        return;
+    }
+    VkMemoryBarrier memory_barrier = {
+        VK_STRUCTURE_TYPE_MEMORY_BARRIER,                           // struct type
+        nullptr,                                                    // pointer to struct extending this
+        VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,  // src access mask
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+            VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT  // dst access mask
+    };
+    vkCmdPipelineBarrier(command_buffer,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 1, &memory_barrier, 0, nullptr, 0, nullptr);
+}
+
+// Wait for all previously submitted work on the queue to complete. When
+// spinning is enabled, an empty submission's fence stands in for
+// vkQueueWaitIdle (a fence signals only after all prior queue operations have
+// completed, and a spin-assisted fence wait avoids the disproportionately
+// expensive blocking wait on some drivers).
+int vk_sync_queue(void *user_context, VulkanMemoryAllocator *allocator, VkQueue queue, uint32_t queue_family_index) {
+    // With no runtime-submitted work pending, vkQueueWaitIdle returns quickly
+    // and still covers submissions made by external users of the queue.
+    if (vk_queue_has_pending_work() && (vk_wait_spin_us() > 0)) {
+        ScopedVulkanCommandBufferAndPool cmds(user_context, allocator, queue_family_index);
+        if (cmds.error_code != halide_error_code_success) {
+            error(user_context) << "Vulkan: Failed to create command buffer and pool!\n";
+            return cmds.error_code;
+        }
+        VkCommandBufferBeginInfo command_buffer_begin_info =
+            {
+                VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,  // struct type
+                nullptr,                                      // pointer to struct extending this
+                VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,  // flags
+                nullptr                                       // pointer to parent command buffer
+            };
+        VkResult result = vkBeginCommandBuffer(cmds.command_buffer, &command_buffer_begin_info);
+        if (result != VK_SUCCESS) {
+            error(user_context) << "Vulkan: vkBeginCommandBuffer returned " << vk_get_error_name(result) << "\n";
+            return halide_error_code_generic_error;
+        }
+        result = vkEndCommandBuffer(cmds.command_buffer);
+        if (result != VK_SUCCESS) {
+            error(user_context) << "Vulkan: vkEndCommandBuffer returned " << vk_get_error_name(result) << "\n";
+            return halide_error_code_generic_error;
+        }
+        int error_code = vk_submit_command_buffer(user_context, queue, cmds.command_buffer, cmds.fence);
+        if (error_code != halide_error_code_success) {
+            error(user_context) << "Vulkan: Failed to submit command buffer!\n";
+            return error_code;
+        }
+        error_code = vk_wait_for_fence(user_context, allocator->current_device(), cmds.fence);
+        if (error_code != halide_error_code_success) {
+            error(user_context) << "Vulkan: Failed to wait for queue sync to finish!\n";
+            return error_code;
+        }
+    } else {
+        VkResult result = vkQueueWaitIdle(queue);
+        if (result != VK_SUCCESS) {
+            error(user_context) << "Vulkan: vkQueueWaitIdle returned " << vk_get_error_name(result) << "\n";
+            return halide_error_code_generic_error;
+        }
+    }
+    vk_mark_queue_drained();
+    return halide_error_code_success;
+}
+
+int vk_sync_queue_if_pending(void *user_context, VulkanMemoryAllocator *allocator, VkQueue queue, uint32_t queue_family_index) {
+    if (vk_queue_has_pending_work()) {
+        return vk_sync_queue(user_context, allocator, queue, queue_family_index);
+    }
+    return halide_error_code_success;
+}
+
 int vk_fill_command_buffer_with_dispatch_call(void *user_context,
                                               VkDevice device,
                                               VkCommandBuffer command_buffer,
@@ -358,6 +441,8 @@ int vk_fill_command_buffer_with_dispatch_call(void *user_context,
         error(user_context) << "vkBeginCommandBuffer returned " << vk_get_error_name(result) << "\n";
         return halide_error_code_generic_error;
     }
+
+    vk_record_ordering_barrier(user_context, command_buffer);
 
     vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, compute_pipeline);
     vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout,

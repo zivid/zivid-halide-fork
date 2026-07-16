@@ -108,6 +108,13 @@ WEAK int halide_vulkan_device_free(void *user_context, halide_buffer_t *halide_b
     uint64_t t_before = halide_current_time_ns(user_context);
 #endif
 
+    // the buffer (or a region recycled from it) may still be used by queued work
+    int error_code = vk_sync_queue_if_pending(user_context, ctx.allocator, ctx.queue, ctx.queue_family_index);
+    if (error_code != halide_error_code_success) {
+        error(user_context) << "Vulkan: Failed to sync queue before releasing device buffer!\n";
+        return error_code;
+    }
+
     // get the allocated region for the device
     MemoryRegion *device_region = reinterpret_cast<MemoryRegion *>(halide_buffer->device);
     MemoryRegion *memory_region = ctx.allocator->owner_of(user_context, device_region);
@@ -185,6 +192,7 @@ WEAK void halide_vulkan_finalize_kernels(void *user_context, void *state_ptr) {
 
     VulkanContext ctx(user_context);
     if (ctx.error == halide_error_code_success) {
+        vk_sync_queue_if_pending(user_context, ctx.allocator, ctx.queue, ctx.queue_family_index);
         compilation_cache.release_hold(user_context, ctx.device, state_ptr);
     }
 
@@ -208,10 +216,10 @@ WEAK int halide_vulkan_device_sync(void *user_context, halide_buffer_t *) {
     uint64_t t_before = halide_current_time_ns(user_context);
 #endif
 
-    VkResult result = vkQueueWaitIdle(ctx.queue);
-    if (result != VK_SUCCESS) {
-        error(user_context) << "Vulkan: vkQueueWaitIdle returned " << vk_get_error_name(result) << "\n";
-        return halide_error_code_generic_error;
+    int error_code = vk_sync_queue(user_context, ctx.allocator, ctx.queue, ctx.queue_family_index);
+    if (error_code != halide_error_code_success) {
+        error(user_context) << "Vulkan: Failed to sync queue!\n";
+        return error_code;
     }
 
 #ifdef DEBUG_RUNTIME
@@ -242,6 +250,7 @@ WEAK int halide_vulkan_device_release(void *user_context) {
     if (acquire_status == halide_error_code_success) {
         // Destroy the context if we created it
         if ((instance == cached_instance) && (device == cached_device)) {
+            vk_sync_queue_if_pending(user_context, allocator, queue, queue_family_index);
             vk_release_cached_command_resources(user_context, allocator);
             destroy_status = vk_destroy_context(user_context, allocator, instance, device, physical_device, queue, messenger);
             cached_allocator = nullptr;
@@ -350,7 +359,10 @@ WEAK int halide_vulkan_device_malloc(void *user_context, halide_buffer_t *buf) {
             return cmds.error_code;
         }
 
-        error_code = vk_clear_device_buffer(user_context, ctx.allocator, cmds.command_buffer, ctx.queue, cmds.fence, *device_buffer);
+        error_code = vk_sync_queue_if_pending(user_context, ctx.allocator, ctx.queue, ctx.queue_family_index);
+        if (error_code == halide_error_code_success) {
+            error_code = vk_clear_device_buffer(user_context, ctx.allocator, cmds.command_buffer, ctx.queue, cmds.fence, *device_buffer);
+        }
         if (error_code != halide_error_code_success) {
             error(user_context) << "Vulkan: Failed to clear device buffer!\n";
         }
@@ -486,6 +498,8 @@ WEAK int halide_vulkan_copy_to_device(void *user_context, halide_buffer_t *halid
         return halide_error_code_device_buffer_copy_failed;
     }
 
+    vk_record_ordering_barrier(user_context, cmds.command_buffer);
+
     // define the src and dst config
     bool from_host = true;
     bool to_host = false;
@@ -527,6 +541,7 @@ WEAK int halide_vulkan_copy_to_device(void *user_context, halide_buffer_t *halid
         error(user_context) << "Vulkan: Failed to wait for copy to finish!\n";
         return halide_error_code_device_buffer_copy_failed;
     }
+    vk_mark_queue_drained();
 
     //// 15. Reclaim the staging buffer
     if (halide_can_reuse_device_allocations(user_context)) {
@@ -643,6 +658,8 @@ WEAK int halide_vulkan_copy_to_host(void *user_context, halide_buffer_t *halide_
         return halide_error_code_device_buffer_copy_failed;
     }
 
+    vk_record_ordering_barrier(user_context, cmds.command_buffer);
+
     // define the src and dst config
     bool from_host = false;
     bool to_host = true;
@@ -684,6 +701,7 @@ WEAK int halide_vulkan_copy_to_host(void *user_context, halide_buffer_t *halide_
         error(user_context) << "Vulkan: Failed to wait for copy to finish!\n";
         return halide_error_code_copy_to_device_failed;
     }
+    vk_mark_queue_drained();
 
     // map the staging region to a host ptr
     uint8_t *stage_host_ptr = (uint8_t *)ctx.allocator->map(user_context, staging_region);
@@ -782,6 +800,7 @@ WEAK int halide_vulkan_buffer_copy(void *user_context, struct halide_buffer_t *s
                 return halide_error_code_copy_to_device_failed;
             }
         }
+        vk_mark_queue_drained();
 
         int error_code = halide_error_code_success;
         if (!from_host && !to_host) {
@@ -959,6 +978,7 @@ WEAK int halide_vulkan_buffer_copy(void *user_context, struct halide_buffer_t *s
             error(user_context) << "Vulkan: Failed to wait for copy to finish!\n";
             return error_code;
         }
+        vk_mark_queue_drained();
 
         if (!from_host && to_host) {
             // map the staging region to a host ptr
@@ -1188,6 +1208,16 @@ WEAK int halide_vulkan_run(void *user_context,
 
     VulkanShaderBinding *entry_point_binding = (shader_module->shader_bindings + entry_point_index);
 
+    // If a previous asynchronous submission of this entry point is still in flight,
+    // its pipeline, descriptor set and uniform args buffer cannot be modified yet.
+    if (entry_point_binding->submit_serial > vk_queue_drained_serial) {
+        error_code = vk_sync_queue_if_pending(user_context, ctx.allocator, ctx.queue, ctx.queue_family_index);
+        if (error_code != halide_error_code_success) {
+            error(user_context) << "Vulkan: Failed to sync queue before reusing entry point!\n";
+            return error_code;
+        }
+    }
+
     // 2c. Setup the compute pipeline (eg override any specializations for shared mem or workgroup size)
     error_code = vk_setup_compute_pipeline(user_context, ctx.allocator, entry_point_binding, &dispatch_data, shader_module->shader_module, shader_module->pipeline_layout, &(entry_point_binding->compute_pipeline));
     if (error_code != halide_error_code_success) {
@@ -1281,11 +1311,19 @@ WEAK int halide_vulkan_run(void *user_context,
         return error_code;
     }
 
-    // 7. Wait until the queue is done with the command buffer
-    error_code = vk_wait_for_fence(user_context, ctx.device, cmds.fence);
-    if (error_code != halide_error_code_success) {
-        error(user_context) << "Vulkan: Failed to wait for dispatch to finish!\n";
-        return error_code;
+    // 7. Either defer completion (async submission mode: sync happens at
+    //    device_sync, copies, frees, or reuse of this entry point), or wait
+    //    for the fence right away.
+    if (vk_use_async_submission()) {
+        cmds.submitted = true;
+        entry_point_binding->submit_serial = vk_next_submit_serial();
+    } else {
+        error_code = vk_wait_for_fence(user_context, ctx.device, cmds.fence);
+        if (error_code != halide_error_code_success) {
+            error(user_context) << "Vulkan: Failed to wait for dispatch to finish!\n";
+            return error_code;
+        }
+        vk_mark_queue_drained();
     }
 
 #ifdef DEBUG_RUNTIME
@@ -1363,6 +1401,11 @@ WEAK int halide_vulkan_release_unused_device_allocations(void *user_context) {
 
     // collect all unused allocations
     if (ctx.allocator) {
+        int error_code = vk_sync_queue_if_pending(user_context, ctx.allocator, ctx.queue, ctx.queue_family_index);
+        if (error_code != halide_error_code_success) {
+            error(user_context) << "Vulkan: Failed to sync queue before collecting unused allocations!\n";
+            return error_code;
+        }
         ctx.allocator->collect(user_context);
     }
     return halide_error_code_success;

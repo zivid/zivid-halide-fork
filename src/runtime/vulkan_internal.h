@@ -55,8 +55,18 @@ int vk_get_env_int(const char *name, int default_value) {
 
 // NOTE: no function-local statics here — the runtime is built without
 // __cxa_guard support, so lazily-initialized globals are used instead.
+int vk_cached_async_submission_env = -1;
 int vk_cached_wait_spin_us_env = -1;
 int vk_cached_clear_on_alloc_env = -1;
+
+// Submit dispatches without blocking on completion (sync happens on device_sync,
+// copies, frees, or reuse of the same kernel's uniform buffer). Disable with HL_VK_ASYNC=0.
+bool vk_use_async_submission() {
+    if (vk_cached_async_submission_env < 0) {
+        vk_cached_async_submission_env = (vk_get_env_int("HL_VK_ASYNC", 1) != 0) ? 1 : 0;
+    }
+    return vk_cached_async_submission_env != 0;
+}
 
 // Max time to busy-poll a fence before falling back to a blocking wait.
 // Blocking waits on some drivers (Mesa ANV) cost far more than the actual GPU
@@ -76,6 +86,25 @@ bool vk_clear_on_alloc() {
         vk_cached_clear_on_alloc_env = (vk_get_env_int("HL_VK_CLEAR_ON_ALLOC", 0) != 0) ? 1 : 0;
     }
     return vk_cached_clear_on_alloc_env != 0;
+}
+
+// --------------------------------------------------------------------------
+// Queue submission tracking (for async submission mode)
+// --------------------------------------------------------------------------
+
+uint64_t vk_queue_submit_serial = 0;
+uint64_t vk_queue_drained_serial = 0;
+
+uint64_t vk_next_submit_serial() {
+    return ++vk_queue_submit_serial;
+}
+
+bool vk_queue_has_pending_work() {
+    return vk_queue_submit_serial > vk_queue_drained_serial;
+}
+
+void vk_mark_queue_drained() {
+    vk_queue_drained_serial = vk_queue_submit_serial;
 }
 
 // --------------------------------------------------------------------------
@@ -166,6 +195,12 @@ int vk_fill_command_buffer_with_dispatch_call(void *user_context,
 int vk_submit_command_buffer(void *user_context, VkQueue queue, VkCommandBuffer command_buffer, VkFence fence);
 
 int vk_wait_for_fence(void *user_context, VkDevice device, VkFence fence);
+
+void vk_record_ordering_barrier(void *user_context, VkCommandBuffer command_buffer);
+
+int vk_sync_queue(void *user_context, VulkanMemoryAllocator *allocator, VkQueue queue, uint32_t queue_family_index);
+
+int vk_sync_queue_if_pending(void *user_context, VulkanMemoryAllocator *allocator, VkQueue queue, uint32_t queue_family_index);
 
 int vk_release_cached_command_resources(void *user_context, VulkanMemoryAllocator *allocator);
 

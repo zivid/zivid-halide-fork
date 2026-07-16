@@ -1480,6 +1480,7 @@ int vk_clear_device_buffer(void *user_context,
         error(user_context) << "Vulkan: Failed to wait for buffer clear to finish!\n";
         return error_code;
     }
+    vk_mark_queue_drained();
 
     return halide_error_code_success;
 }
