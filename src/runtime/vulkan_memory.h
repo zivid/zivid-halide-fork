@@ -930,12 +930,19 @@ uint32_t VulkanMemoryAllocator::preferred_flags_for_memory_properties(
     void *user_context, MemoryProperties properties) const {
 
     uint32_t preferred_flags = 0;  //< preferred memory flags for requested access type
+    bool wants_host_cached = (properties.caching == MemoryCaching::Cached) ||
+                             (properties.caching == MemoryCaching::CachedCoherent);
     switch (properties.visibility) {
     case MemoryVisibility::HostOnly:
         preferred_flags |= VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
         break;
     case MemoryVisibility::DeviceToHost:
-        preferred_flags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        // Buffers the CPU will read must prefer host-cached memory over
+        // device-local: CPU reads from write-combined device-local mappings
+        // (e.g. PCIe BAR) run orders of magnitude slower.
+        if (!wants_host_cached) {
+            preferred_flags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        }
         break;
     case MemoryVisibility::HostToDevice:
     case MemoryVisibility::DefaultVisibility:
