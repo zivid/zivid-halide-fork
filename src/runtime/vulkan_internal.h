@@ -56,6 +56,7 @@ int vk_get_env_int(const char *name, int default_value) {
 // NOTE: no function-local statics here — the runtime is built without
 // __cxa_guard support, so lazily-initialized globals are used instead.
 int vk_cached_wait_spin_us_env = -1;
+int vk_cached_clear_on_alloc_env = -1;
 
 // Max time to busy-poll a fence before falling back to a blocking wait.
 // Blocking waits on some drivers (Mesa ANV) cost far more than the actual GPU
@@ -66,6 +67,15 @@ int vk_wait_spin_us() {
         vk_cached_wait_spin_us_env = (value < 0) ? 0 : value;
     }
     return vk_cached_wait_spin_us_env;
+}
+
+// Zero-fill device allocations on malloc (legacy behaviour; CUDA/OpenCL backends
+// never did this). Enable with HL_VK_CLEAR_ON_ALLOC=1.
+bool vk_clear_on_alloc() {
+    if (vk_cached_clear_on_alloc_env < 0) {
+        vk_cached_clear_on_alloc_env = (vk_get_env_int("HL_VK_CLEAR_ON_ALLOC", 0) != 0) ? 1 : 0;
+    }
+    return vk_cached_clear_on_alloc_env != 0;
 }
 
 // --------------------------------------------------------------------------

@@ -342,15 +342,18 @@ WEAK int halide_vulkan_device_malloc(void *user_context, halide_buffer_t *buf) {
         return halide_error_code_internal_error;
     }
 
-    ScopedVulkanCommandBufferAndPool cmds(user_context, ctx.allocator, ctx.queue_family_index);
-    if (cmds.error_code != halide_error_code_success) {
-        error(user_context) << "Vulkan: Failed to create command buffer and pool for context!\n";
-        return cmds.error_code;
-    }
+    int error_code = halide_error_code_success;
+    if (vk_clear_on_alloc()) {
+        ScopedVulkanCommandBufferAndPool cmds(user_context, ctx.allocator, ctx.queue_family_index);
+        if (cmds.error_code != halide_error_code_success) {
+            error(user_context) << "Vulkan: Failed to create command buffer and pool for context!\n";
+            return cmds.error_code;
+        }
 
-    int error_code = vk_clear_device_buffer(user_context, ctx.allocator, cmds.command_buffer, ctx.queue, cmds.fence, *device_buffer);
-    if (error_code != halide_error_code_success) {
-        error(user_context) << "Vulkan: Failed to clear device buffer!\n";
+        error_code = vk_clear_device_buffer(user_context, ctx.allocator, cmds.command_buffer, ctx.queue, cmds.fence, *device_buffer);
+        if (error_code != halide_error_code_success) {
+            error(user_context) << "Vulkan: Failed to clear device buffer!\n";
+        }
     }
 
 #ifdef DEBUG_RUNTIME
