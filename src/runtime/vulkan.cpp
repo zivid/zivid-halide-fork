@@ -409,6 +409,40 @@ WEAK int halide_vulkan_copy_to_device(void *user_context, halide_buffer_t *halid
     }
     device_copy copy_helper = make_host_to_device_copy(halide_buffer);
 
+    // On unified-memory devices the device buffer is host-visible and coherent,
+    // so the copy can be serviced directly with a mapped memcpy ... no staging
+    // buffer and no queue submission required.
+    if (ctx.allocator->use_unified_memory_buffers()) {
+        int error_code = vk_sync_queue_if_pending(user_context, ctx.allocator, ctx.queue, ctx.queue_family_index);
+        if (error_code != halide_error_code_success) {
+            error(user_context) << "Vulkan: Failed to sync queue before copying to device!\n";
+            return error_code;
+        }
+
+        MemoryRegion *device_region = reinterpret_cast<MemoryRegion *>(halide_buffer->device);
+        MemoryRegion *memory_region = ctx.allocator->owner_of(user_context, device_region);
+        uint8_t *device_host_ptr = (uint8_t *)ctx.allocator->map(user_context, memory_region);
+        if (device_host_ptr == nullptr) {
+            error(user_context) << "Vulkan: Failed to map host pointer to device memory!\n";
+            return halide_error_code_internal_error;
+        }
+
+        copy_helper.dst = (uint64_t)device_host_ptr + (uint64_t)(device_region->indexing.offset * halide_buffer->type.bytes());
+        copy_memory(copy_helper, user_context);
+
+        error_code = ctx.allocator->unmap(user_context, memory_region);
+        if (error_code != halide_error_code_success) {
+            error(user_context) << "Vulkan: Failed to unmap host pointer to device memory!\n";
+            return error_code;
+        }
+
+#ifdef DEBUG_RUNTIME
+        uint64_t t_after = halide_current_time_ns(user_context);
+        debug(user_context) << "    Time: " << (t_after - t_before) / 1.0e6 << " ms\n";
+#endif
+        return halide_error_code_success;
+    }
+
     // We construct a staging buffer to copy into from host memory.  Then,
     // we use vkCmdCopyBuffer() to copy from the staging buffer into the
     // the actual device memory.
@@ -587,6 +621,42 @@ WEAK int halide_vulkan_copy_to_host(void *user_context, halide_buffer_t *halide_
     }
 
     device_copy copy_helper = make_device_to_host_copy(halide_buffer);
+
+    // On unified-memory devices with host-cached memory the device buffer can
+    // be read directly with a mapped memcpy ... no staging buffer and no queue
+    // submission required. (Without host-caching the mapping would be
+    // write-combined, and CPU reads from it are orders of magnitude slower
+    // than the staging path below.)
+    if (ctx.allocator->use_unified_memory_cached_reads()) {
+        int error_code = vk_sync_queue_if_pending(user_context, ctx.allocator, ctx.queue, ctx.queue_family_index);
+        if (error_code != halide_error_code_success) {
+            error(user_context) << "Vulkan: Failed to sync queue before copying to host!\n";
+            return error_code;
+        }
+
+        MemoryRegion *device_region = reinterpret_cast<MemoryRegion *>(halide_buffer->device);
+        MemoryRegion *memory_region = ctx.allocator->owner_of(user_context, device_region);
+        uint8_t *device_host_ptr = (uint8_t *)ctx.allocator->map(user_context, memory_region);
+        if (device_host_ptr == nullptr) {
+            error(user_context) << "Vulkan: Failed to map host pointer to device memory!\n";
+            return halide_error_code_internal_error;
+        }
+
+        copy_helper.src = (uint64_t)device_host_ptr + (uint64_t)(device_region->indexing.offset * halide_buffer->type.bytes());
+        copy_memory(copy_helper, user_context);
+
+        error_code = ctx.allocator->unmap(user_context, memory_region);
+        if (error_code != halide_error_code_success) {
+            error(user_context) << "Vulkan: Failed to unmap host pointer to device memory!\n";
+            return error_code;
+        }
+
+#ifdef DEBUG_RUNTIME
+        uint64_t t_after = halide_current_time_ns(user_context);
+        debug(user_context) << "    Time: " << (t_after - t_before) / 1.0e6 << " ms\n";
+#endif
+        return halide_error_code_success;
+    }
 
     // This is the inverse of copy_to_device: we create a staging buffer, copy into
     // it, map it so the host can see it, then copy into the host buffer

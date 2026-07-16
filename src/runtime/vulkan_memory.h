@@ -147,6 +147,24 @@ private:
     VkPhysicalDeviceLimits physical_device_limits = {};
     const VkAllocationCallbacks *alloc_callbacks = nullptr;
     BlockAllocator *block_allocator = nullptr;
+    bool unified_memory = false;
+    bool unified_memory_all_cached = false;
+
+public:
+    // On unified-memory devices (integrated GPUs, CPU implementations) device
+    // buffers are allocated host-visible and coherent, so host->device copies
+    // can be serviced with a direct map + memcpy instead of a staging buffer
+    // plus a queue submission. Override auto-detection with HL_VK_UMA=0/1.
+    bool use_unified_memory_buffers() const {
+        return unified_memory;
+    }
+
+    // Direct-map *reads* of device buffers are only safe performance-wise when
+    // the unified memory is host-cached: CPU reads from write-combined mappings
+    // run orders of magnitude slower than through a cached staging buffer.
+    bool use_unified_memory_cached_reads() const {
+        return unified_memory && unified_memory_all_cached;
+    }
 };
 
 VulkanMemoryAllocator *VulkanMemoryAllocator::create(void *user_context,
@@ -221,6 +239,37 @@ int VulkanMemoryAllocator::initialize(void *user_context,
     memset(&physical_device_limits, 0, sizeof(VkPhysicalDeviceLimits));
     vkGetPhysicalDeviceProperties(physical_device, &physical_device_properties);
     memcpy(&physical_device_limits, &(physical_device_properties.limits), sizeof(VkPhysicalDeviceLimits));
+
+    bool integrated_device = (physical_device_properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) ||
+                             (physical_device_properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU);
+
+    VkPhysicalDeviceMemoryProperties device_memory_properties;
+    vkGetPhysicalDeviceMemoryProperties(physical_device, &device_memory_properties);
+    constexpr uint32_t unified_flags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    bool has_unified_memory_type = false;
+    unified_memory_all_cached = true;
+    for (uint32_t type_index = 0; type_index < device_memory_properties.memoryTypeCount; type_index++) {
+        VkMemoryPropertyFlags type_flags = device_memory_properties.memoryTypes[type_index].propertyFlags;
+        if ((type_flags & unified_flags) == unified_flags) {
+            has_unified_memory_type = true;
+            if (!(type_flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) {
+                unified_memory_all_cached = false;
+            }
+        }
+    }
+
+    int unified_memory_env = vk_get_env_int("HL_VK_UMA", -1);
+    if (unified_memory_env < 0) {
+        unified_memory = integrated_device && has_unified_memory_type;
+    } else {
+        unified_memory = (unified_memory_env != 0) && has_unified_memory_type;
+    }
+
+    debug(user_context) << "VulkanMemoryAllocator: Using "
+                        << (unified_memory ? "unified" : "discrete")
+                        << " memory buffers (device_type=" << (uint32_t)physical_device_properties.deviceType << ")\n";
     return halide_error_code_success;
 }
 
@@ -856,6 +905,9 @@ uint32_t VulkanMemoryAllocator::required_flags_for_memory_properties(
     switch (properties.visibility) {
     case MemoryVisibility::DeviceOnly:
         required_flags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        if (unified_memory) {
+            required_flags |= VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        }
         break;
     case MemoryVisibility::DeviceToHost:
         required_flags |= VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
