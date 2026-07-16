@@ -32,6 +32,43 @@ struct VulkanCompilationCacheEntry;
 namespace {  // internalize
 
 // --------------------------------------------------------------------------
+// Environment
+// --------------------------------------------------------------------------
+
+int vk_get_env_int(const char *name, int default_value) {
+    const char *value = getenv(name);
+    if ((value == nullptr) || (value[0] == 0)) {
+        return default_value;
+    }
+    int result = 0;
+    bool negative = false;
+    const char *ptr = value;
+    if (*ptr == '-') {
+        negative = true;
+        ptr++;
+    }
+    for (; (*ptr >= '0') && (*ptr <= '9'); ptr++) {
+        result = (result * 10) + (*ptr - '0');
+    }
+    return negative ? -result : result;
+}
+
+// NOTE: no function-local statics here — the runtime is built without
+// __cxa_guard support, so lazily-initialized globals are used instead.
+int vk_cached_wait_spin_us_env = -1;
+
+// Max time to busy-poll a fence before falling back to a blocking wait.
+// Blocking waits on some drivers (Mesa ANV) cost far more than the actual GPU
+// work remaining; a bounded spin mirrors what Intel's OpenCL runtime does.
+int vk_wait_spin_us() {
+    if (vk_cached_wait_spin_us_env < 0) {
+        int value = vk_get_env_int("HL_VK_WAIT_SPIN_US", 200);
+        vk_cached_wait_spin_us_env = (value < 0) ? 0 : value;
+    }
+    return vk_cached_wait_spin_us_env;
+}
+
+// --------------------------------------------------------------------------
 // Memory
 // --------------------------------------------------------------------------
 void *vk_host_malloc(void *user_context, size_t size, size_t alignment, VkSystemAllocationScope scope, const VkAllocationCallbacks *callbacks = nullptr);
@@ -45,6 +82,7 @@ int vk_clear_device_buffer(void *user_context,
                            VulkanMemoryAllocator *allocator,
                            VkCommandBuffer command_buffer,
                            VkQueue command_queue,
+                           VkFence fence,
                            VkBuffer device_buffer);
 // --------------------------------------------------------------------------
 // Context
@@ -115,7 +153,11 @@ int vk_fill_command_buffer_with_dispatch_call(void *user_context,
                                               uint32_t descriptor_set_index,
                                               int blocksX, int blocksY, int blocksZ);
 
-int vk_submit_command_buffer(void *user_context, VkQueue queue, VkCommandBuffer command_buffer);
+int vk_submit_command_buffer(void *user_context, VkQueue queue, VkCommandBuffer command_buffer, VkFence fence);
+
+int vk_wait_for_fence(void *user_context, VkDevice device, VkFence fence);
+
+int vk_release_cached_command_resources(void *user_context, VulkanMemoryAllocator *allocator);
 
 // -- Scalar Uniform Buffer
 bool vk_needs_scalar_uniform_buffer(void *user_context,

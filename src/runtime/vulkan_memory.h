@@ -1417,6 +1417,7 @@ int vk_clear_device_buffer(void *user_context,
                            VulkanMemoryAllocator *allocator,
                            VkCommandBuffer command_buffer,
                            VkQueue command_queue,
+                           VkFence fence,
                            VkBuffer device_buffer) {
 
 #ifdef DEBUG_RUNTIME
@@ -1467,17 +1468,17 @@ int vk_clear_device_buffer(void *user_context,
             nullptr                         // the semaphores to signal
         };
 
-    result = vkQueueSubmit(command_queue, 1, &submit_info, VK_NULL_HANDLE);
+    result = vkQueueSubmit(command_queue, 1, &submit_info, fence);
     if (result != VK_SUCCESS) {
         error(user_context) << "Vulkan: vkQueueSubmit returned " << vk_get_error_name(result) << "\n";
         return halide_error_code_generic_error;
     }
 
     // wait for memset to finish
-    result = vkQueueWaitIdle(command_queue);
-    if (result != VK_SUCCESS) {
-        error(user_context) << "Vulkan: vkQueueWaitIdle returned " << vk_get_error_name(result) << "\n";
-        return halide_error_code_generic_error;
+    int error_code = vk_wait_for_fence(user_context, allocator->current_device(), fence);
+    if (error_code != halide_error_code_success) {
+        error(user_context) << "Vulkan: Failed to wait for buffer clear to finish!\n";
+        return error_code;
     }
 
     return halide_error_code_success;

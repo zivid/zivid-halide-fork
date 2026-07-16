@@ -242,6 +242,7 @@ WEAK int halide_vulkan_device_release(void *user_context) {
     if (acquire_status == halide_error_code_success) {
         // Destroy the context if we created it
         if ((instance == cached_instance) && (device == cached_device)) {
+            vk_release_cached_command_resources(user_context, allocator);
             destroy_status = vk_destroy_context(user_context, allocator, instance, device, physical_device, queue, messenger);
             cached_allocator = nullptr;
             cached_device = VK_NULL_HANDLE;
@@ -347,7 +348,7 @@ WEAK int halide_vulkan_device_malloc(void *user_context, halide_buffer_t *buf) {
         return cmds.error_code;
     }
 
-    int error_code = vk_clear_device_buffer(user_context, ctx.allocator, cmds.command_buffer, ctx.queue, *device_buffer);
+    int error_code = vk_clear_device_buffer(user_context, ctx.allocator, cmds.command_buffer, ctx.queue, cmds.fence, *device_buffer);
     if (error_code != halide_error_code_success) {
         error(user_context) << "Vulkan: Failed to clear device buffer!\n";
     }
@@ -511,29 +512,16 @@ WEAK int halide_vulkan_copy_to_device(void *user_context, halide_buffer_t *halid
     }
 
     //// 13. Submit the command buffer to our command queue
-    VkSubmitInfo submit_info =
-        {
-            VK_STRUCTURE_TYPE_SUBMIT_INFO,  // struct type
-            nullptr,                        // pointer to struct extending this
-            0,                              // wait semaphore count
-            nullptr,                        // semaphores
-            nullptr,                        // pipeline stages where semaphore waits occur
-            1,                              // how many command buffers to execute
-            &(cmds.command_buffer),         // the command buffers
-            0,                              // number of semaphores to signal
-            nullptr                         // the semaphores to signal
-        };
-
-    result = vkQueueSubmit(ctx.queue, 1, &submit_info, VK_NULL_HANDLE);
-    if (result != VK_SUCCESS) {
-        error(user_context) << "Vulkan: vkQueueSubmit returned " << vk_get_error_name(result) << "\n";
+    error_code = vk_submit_command_buffer(user_context, ctx.queue, cmds.command_buffer, cmds.fence);
+    if (error_code != halide_error_code_success) {
+        error(user_context) << "Vulkan: Failed to submit command buffer!\n";
         return halide_error_code_device_buffer_copy_failed;
     }
 
     //// 14. Wait until the queue is done with the command buffer
-    result = vkQueueWaitIdle(ctx.queue);
-    if (result != VK_SUCCESS) {
-        error(user_context) << "Vulkan: vkQueueWaitIdle returned " << vk_get_error_name(result) << "\n";
+    error_code = vk_wait_for_fence(user_context, ctx.device, cmds.fence);
+    if (error_code != halide_error_code_success) {
+        error(user_context) << "Vulkan: Failed to wait for copy to finish!\n";
         return halide_error_code_device_buffer_copy_failed;
     }
 
@@ -681,29 +669,16 @@ WEAK int halide_vulkan_copy_to_host(void *user_context, halide_buffer_t *halide_
     }
 
     //// 13. Submit the command buffer to our command queue
-    VkSubmitInfo submit_info =
-        {
-            VK_STRUCTURE_TYPE_SUBMIT_INFO,  // struct type
-            nullptr,                        // pointer to struct extending this
-            0,                              // wait semaphore count
-            nullptr,                        // semaphores
-            nullptr,                        // pipeline stages where semaphore waits occur
-            1,                              // how many command buffers to execute
-            &(cmds.command_buffer),         // the command buffers
-            0,                              // number of semaphores to signal
-            nullptr                         // the semaphores to signal
-        };
-
-    result = vkQueueSubmit(ctx.queue, 1, &submit_info, VK_NULL_HANDLE);
-    if (result != VK_SUCCESS) {
-        error(user_context) << "Vulkan: vkQueueSubmit returned " << vk_get_error_name(result) << "\n";
+    error_code = vk_submit_command_buffer(user_context, ctx.queue, cmds.command_buffer, cmds.fence);
+    if (error_code != halide_error_code_success) {
+        error(user_context) << "Vulkan: Failed to submit command buffer!\n";
         return halide_error_code_copy_to_device_failed;
     }
 
     //// 14. Wait until the queue is done with the command buffer
-    result = vkQueueWaitIdle(ctx.queue);
-    if (result != VK_SUCCESS) {
-        error(user_context) << "Vulkan: vkQueueWaitIdle returned " << vk_get_error_name(result) << "\n";
+    error_code = vk_wait_for_fence(user_context, ctx.device, cmds.fence);
+    if (error_code != halide_error_code_success) {
+        error(user_context) << "Vulkan: Failed to wait for copy to finish!\n";
         return halide_error_code_copy_to_device_failed;
     }
 
@@ -969,30 +944,17 @@ WEAK int halide_vulkan_buffer_copy(void *user_context, struct halide_buffer_t *s
         }
 
         //// submit the command buffer to our command queue
-        VkSubmitInfo submit_info =
-            {
-                VK_STRUCTURE_TYPE_SUBMIT_INFO,  // struct type
-                nullptr,                        // pointer to struct extending this
-                0,                              // wait semaphore count
-                nullptr,                        // semaphores
-                nullptr,                        // pipeline stages where semaphore waits occur
-                1,                              // how many command buffers to execute
-                &(cmds.command_buffer),         // the command buffers
-                0,                              // number of semaphores to signal
-                nullptr                         // the semaphores to signal
-            };
-
-        result = vkQueueSubmit(ctx.queue, 1, &submit_info, VK_NULL_HANDLE);
-        if (result != VK_SUCCESS) {
-            error(user_context) << "vkQueueSubmit returned " << vk_get_error_name(result) << "\n";
-            return result;
+        error_code = vk_submit_command_buffer(user_context, ctx.queue, cmds.command_buffer, cmds.fence);
+        if (error_code != halide_error_code_success) {
+            error(user_context) << "Vulkan: Failed to submit command buffer!\n";
+            return error_code;
         }
 
         //// wait until the queue is done with the command buffer
-        result = vkQueueWaitIdle(ctx.queue);
-        if (result != VK_SUCCESS) {
-            error(user_context) << "vkQueueWaitIdle returned " << vk_get_error_name(result) << "\n";
-            return result;
+        error_code = vk_wait_for_fence(user_context, ctx.device, cmds.fence);
+        if (error_code != halide_error_code_success) {
+            error(user_context) << "Vulkan: Failed to wait for copy to finish!\n";
+            return error_code;
         }
 
         if (!from_host && to_host) {
@@ -1310,17 +1272,17 @@ WEAK int halide_vulkan_run(void *user_context,
     }
 
     // 6. Submit the command buffer to our command queue
-    error_code = vk_submit_command_buffer(user_context, ctx.queue, cmds.command_buffer);
+    error_code = vk_submit_command_buffer(user_context, ctx.queue, cmds.command_buffer, cmds.fence);
     if (error_code != halide_error_code_success) {
         error(user_context) << "Vulkan: Failed to fill submit command buffer!\n";
         return error_code;
     }
 
     // 7. Wait until the queue is done with the command buffer
-    VkResult result = vkQueueWaitIdle(ctx.queue);
-    if (result != VK_SUCCESS) {
-        error(user_context) << "Vulkan: vkQueueWaitIdle returned " << vk_get_error_name(result) << "\n";
-        return halide_error_code_generic_error;
+    error_code = vk_wait_for_fence(user_context, ctx.device, cmds.fence);
+    if (error_code != halide_error_code_success) {
+        error(user_context) << "Vulkan: Failed to wait for dispatch to finish!\n";
+        return error_code;
     }
 
 #ifdef DEBUG_RUNTIME

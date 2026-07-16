@@ -173,23 +173,122 @@ int vk_destroy_command_buffer(void *user_context, VulkanMemoryAllocator *allocat
     return halide_error_code_success;
 }
 
-// Struct for handling destruction of a transient command buffer ... gets destroyed when object goes out of scope
+// Cached command pool + command buffer + fence, reused across submissions to
+// avoid recreating a VkCommandPool for every dispatch/copy (a dominant part of
+// the fixed per-dispatch cost). Entries are recycled through a freelist once
+// their fence has signalled, and destroyed when the device context is released.
+struct VulkanCommandResources {
+    VkCommandPool command_pool = VK_NULL_HANDLE;
+    VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    bool submitted = false;
+    VulkanCommandResources *next = nullptr;
+};
+
+VulkanCommandResources *cached_command_resources = nullptr;
+ScopedSpinLock::AtomicFlag cached_command_resources_lock = 0;
+
+int vk_wait_for_fence(void *user_context, VkDevice device, VkFence fence) {
+    int spin_us = vk_wait_spin_us();
+    if (spin_us > 0) {
+        int64_t deadline_ns = halide_current_time_ns(user_context) + (int64_t)spin_us * 1000;
+        do {
+            VkResult status = vkGetFenceStatus(device, fence);
+            if (status == VK_SUCCESS) {
+                return halide_error_code_success;
+            }
+            if (status != VK_NOT_READY) {
+                error(user_context) << "Vulkan: vkGetFenceStatus returned " << vk_get_error_name(status) << "\n";
+                return halide_error_code_generic_error;
+            }
+        } while (halide_current_time_ns(user_context) < deadline_ns);
+    }
+    VkResult result = vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+    if (result != VK_SUCCESS) {
+        error(user_context) << "Vulkan: vkWaitForFences returned " << vk_get_error_name(result) << "\n";
+        return halide_error_code_generic_error;
+    }
+    return halide_error_code_success;
+}
+
 struct ScopedVulkanCommandBufferAndPool {
     void *user_context = nullptr;
     VulkanMemoryAllocator *allocator = nullptr;
     VkCommandPool command_pool = VK_NULL_HANDLE;
     VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    bool submitted = false;
     int error_code = halide_error_code_success;
 
     ScopedVulkanCommandBufferAndPool(void *uc, VulkanMemoryAllocator *vma, uint32_t queue_family_index)
         : user_context(uc), allocator(vma) {
+
+        VulkanCommandResources *entry = nullptr;
+        {
+            ScopedSpinLock lock(&cached_command_resources_lock);
+            VulkanCommandResources **prev_next = &cached_command_resources;
+            for (VulkanCommandResources *candidate = cached_command_resources; candidate != nullptr; candidate = candidate->next) {
+                if (!candidate->submitted || (vkGetFenceStatus(allocator->current_device(), candidate->fence) == VK_SUCCESS)) {
+                    *prev_next = candidate->next;
+                    entry = candidate;
+                    break;
+                }
+                prev_next = &(candidate->next);
+            }
+        }
+
+        if (entry != nullptr) {
+            command_pool = entry->command_pool;
+            command_buffer = entry->command_buffer;
+            fence = entry->fence;
+            vk_host_free(user_context, entry, allocator->callbacks());
+            vkResetCommandPool(allocator->current_device(), command_pool, 0);
+            VkResult result = vkResetFences(allocator->current_device(), 1, &fence);
+            if (result != VK_SUCCESS) {
+                error(user_context) << "Vulkan: vkResetFences returned " << vk_get_error_name(result) << "\n";
+                error_code = halide_error_code_generic_error;
+            }
+            return;
+        }
+
         error_code = vk_create_command_pool(user_context, allocator, queue_family_index, &command_pool);
         if (error_code == halide_error_code_success) {
             error_code = vk_create_command_buffer(user_context, allocator, command_pool, &command_buffer);
         }
+        if (error_code == halide_error_code_success) {
+            VkFenceCreateInfo fence_info = {
+                VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,  // struct type
+                nullptr,                              // pointer to struct extending this
+                0                                     // flags
+            };
+            VkResult result = vkCreateFence(allocator->current_device(), &fence_info, allocator->callbacks(), &fence);
+            if (result != VK_SUCCESS) {
+                error(user_context) << "Vulkan: vkCreateFence returned " << vk_get_error_name(result) << "\n";
+                error_code = halide_error_code_generic_error;
+            }
+        }
     }
+
     ~ScopedVulkanCommandBufferAndPool() {
+        if ((allocator != nullptr) && (command_pool != VK_NULL_HANDLE) && (command_buffer != VK_NULL_HANDLE) && (fence != VK_NULL_HANDLE)) {
+            VulkanCommandResources *entry = (VulkanCommandResources *)vk_host_malloc(user_context, sizeof(VulkanCommandResources), 0, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT, allocator->callbacks());
+            if (entry != nullptr) {
+                entry->command_pool = command_pool;
+                entry->command_buffer = command_buffer;
+                entry->fence = fence;
+                entry->submitted = submitted;
+                ScopedSpinLock lock(&cached_command_resources_lock);
+                entry->next = cached_command_resources;
+                cached_command_resources = entry;
+                command_pool = VK_NULL_HANDLE;
+                command_buffer = VK_NULL_HANDLE;
+                fence = VK_NULL_HANDLE;
+            }
+        }
         if ((allocator != nullptr) && (command_pool != VK_NULL_HANDLE)) {
+            if (fence != VK_NULL_HANDLE) {
+                vkDestroyFence(allocator->current_device(), fence, allocator->callbacks());
+            }
             if (command_buffer != VK_NULL_HANDLE) {
                 vk_destroy_command_buffer(user_context, allocator, command_pool, command_buffer);
             }
@@ -199,8 +298,33 @@ struct ScopedVulkanCommandBufferAndPool {
         allocator = nullptr;
         command_pool = VK_NULL_HANDLE;
         command_buffer = VK_NULL_HANDLE;
+        fence = VK_NULL_HANDLE;
     }
 };
+
+int vk_release_cached_command_resources(void *user_context, VulkanMemoryAllocator *allocator) {
+    VulkanCommandResources *entry = nullptr;
+    {
+        ScopedSpinLock lock(&cached_command_resources_lock);
+        entry = cached_command_resources;
+        cached_command_resources = nullptr;
+    }
+    while (entry != nullptr) {
+        VulkanCommandResources *next = entry->next;
+        if (entry->fence != VK_NULL_HANDLE) {
+            vkDestroyFence(allocator->current_device(), entry->fence, allocator->callbacks());
+        }
+        if (entry->command_buffer != VK_NULL_HANDLE) {
+            vk_destroy_command_buffer(user_context, allocator, entry->command_pool, entry->command_buffer);
+        }
+        if (entry->command_pool != VK_NULL_HANDLE) {
+            vk_destroy_command_pool(user_context, allocator, entry->command_pool);
+        }
+        vk_host_free(user_context, entry, allocator->callbacks());
+        entry = next;
+    }
+    return halide_error_code_success;
+}
 
 int vk_fill_command_buffer_with_dispatch_call(void *user_context,
                                               VkDevice device,
@@ -249,12 +373,13 @@ int vk_fill_command_buffer_with_dispatch_call(void *user_context,
     return halide_error_code_success;
 }
 
-int vk_submit_command_buffer(void *user_context, VkQueue queue, VkCommandBuffer command_buffer) {
+int vk_submit_command_buffer(void *user_context, VkQueue queue, VkCommandBuffer command_buffer, VkFence fence) {
 #ifdef DEBUG_RUNTIME
     debug(user_context)
         << " vk_submit_command_buffer (user_context: " << user_context << ", "
         << "queue: " << (void *)queue << ", "
-        << "command_buffer: " << (void *)command_buffer << ")\n";
+        << "command_buffer: " << (void *)command_buffer << ", "
+        << "fence: " << (void *)fence << ")\n";
 #endif
 
     VkSubmitInfo submit_info =
@@ -270,7 +395,7 @@ int vk_submit_command_buffer(void *user_context, VkQueue queue, VkCommandBuffer 
             nullptr                         // the semaphores to signal
         };
 
-    VkResult result = vkQueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE);
+    VkResult result = vkQueueSubmit(queue, 1, &submit_info, fence);
     if (result != VK_SUCCESS) {
         error(user_context) << "Vulkan: vkQueueSubmit returned " << vk_get_error_name(result) << "\n";
         return halide_error_code_generic_error;
