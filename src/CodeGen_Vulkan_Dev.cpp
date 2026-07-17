@@ -2875,6 +2875,18 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::declare_device_args(const Stmt &s, uint3
             SpvBuilder::Literals zero_literal = {uint32_t(0)};
             builder.add_struct_annotation(struct_type_id, 0, SpvDecorationOffset, zero_literal);
 
+            // Halide device buffers never alias each other, and their read/write
+            // usage is known ... annotate accordingly so drivers don't have to
+            // assume the worst (the OpenCL backend passes every buffer argument
+            // as `restrict`, with `const` for read-only buffers)
+            builder.add_annotation(buffer_block_var_id, SpvDecorationRestrict);
+            if (!arg.write) {
+                builder.add_annotation(buffer_block_var_id, SpvDecorationNonWritable);
+            }
+            if (!arg.read) {
+                builder.add_annotation(buffer_block_var_id, SpvDecorationNonReadable);
+            }
+
             // Set descriptor set and binding indices
             SpvBuilder::Literals dset_index = {entry_point_index};
             SpvBuilder::Literals binding_index = {binding_counter++};
