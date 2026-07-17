@@ -39,12 +39,22 @@ struct VulkanSharedMemoryAllocation {
     const char *variable_name = nullptr;
 };
 
+// Per-dispatch resources that stay referenced while a submission is in
+// flight. Each entry point keeps a small ring of these so the same kernel
+// can be dispatched repeatedly into one batch without draining the queue.
+static constexpr uint32_t vk_max_inflight_dispatches = 8;
+
+struct VulkanDispatchResources {
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    MemoryRegion *args_region = nullptr;
+    uint64_t submit_serial = 0;
+};
+
 // Entry point metadata for shader modules
 struct VulkanShaderBinding {
     char *entry_point_name = nullptr;
     VulkanDispatchData dispatch_data = {};
-    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
-    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
     VkPipeline compute_pipeline = VK_NULL_HANDLE;
     uint32_t uniform_buffer_count = 0;
     uint32_t storage_buffer_count = 0;
@@ -53,8 +63,12 @@ struct VulkanShaderBinding {
     VulkanSpecializationConstant *specialization_constants = nullptr;
     VulkanSharedMemoryAllocation *shared_memory_allocations = nullptr;
     uint32_t bindings_count = 0;
-    MemoryRegion *args_region = nullptr;
-    uint64_t submit_serial = 0;
+    VulkanDispatchResources dispatch_resources[vk_max_inflight_dispatches] = {};
+    uint32_t next_dispatch_resource = 0;
+    uint64_t pipeline_submit_serial = 0;
+    uint32_t pipeline_dispatch_constant_count = 0;
+    uint32_t pipeline_dispatch_constant_ids[4] = {0, 0, 0, 0};
+    uint32_t pipeline_dispatch_constant_values[4] = {0, 0, 0, 0};
 };
 
 // Compiled shader module and associated bindings
@@ -212,10 +226,95 @@ int vk_wait_for_fence(void *user_context, VkDevice device, VkFence fence) {
     return halide_error_code_success;
 }
 
+int vk_destroy_command_resources(void *user_context, VulkanMemoryAllocator *allocator, VulkanCommandResources *entry) {
+    if (entry == nullptr) {
+        return halide_error_code_success;
+    }
+    if (entry->fence != VK_NULL_HANDLE) {
+        vkDestroyFence(allocator->current_device(), entry->fence, allocator->callbacks());
+    }
+    if (entry->command_buffer != VK_NULL_HANDLE) {
+        vk_destroy_command_buffer(user_context, allocator, entry->command_pool, entry->command_buffer);
+    }
+    if (entry->command_pool != VK_NULL_HANDLE) {
+        vk_destroy_command_pool(user_context, allocator, entry->command_pool);
+    }
+    vk_host_free(user_context, entry, allocator->callbacks());
+    return halide_error_code_success;
+}
+
+int vk_acquire_command_resources(void *user_context, VulkanMemoryAllocator *allocator, uint32_t queue_family_index, VulkanCommandResources **out_entry) {
+    *out_entry = nullptr;
+
+    VulkanCommandResources *entry = nullptr;
+    {
+        ScopedSpinLock lock(&cached_command_resources_lock);
+        VulkanCommandResources **prev_next = &cached_command_resources;
+        for (VulkanCommandResources *candidate = cached_command_resources; candidate != nullptr; candidate = candidate->next) {
+            if (!candidate->submitted || (vkGetFenceStatus(allocator->current_device(), candidate->fence) == VK_SUCCESS)) {
+                *prev_next = candidate->next;
+                entry = candidate;
+                break;
+            }
+            prev_next = &(candidate->next);
+        }
+    }
+
+    if (entry != nullptr) {
+        entry->next = nullptr;
+        entry->submitted = false;
+        vkResetCommandPool(allocator->current_device(), entry->command_pool, 0);
+        VkResult result = vkResetFences(allocator->current_device(), 1, &(entry->fence));
+        if (result != VK_SUCCESS) {
+            error(user_context) << "Vulkan: vkResetFences returned " << vk_get_error_name(result) << "\n";
+            vk_destroy_command_resources(user_context, allocator, entry);
+            return halide_error_code_generic_error;
+        }
+        *out_entry = entry;
+        return halide_error_code_success;
+    }
+
+    entry = (VulkanCommandResources *)vk_host_malloc(user_context, sizeof(VulkanCommandResources), 0, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT, allocator->callbacks());
+    if (entry == nullptr) {
+        error(user_context) << "Vulkan: Failed to allocate command resources entry!\n";
+        return halide_error_code_out_of_memory;
+    }
+    *entry = VulkanCommandResources();
+
+    int error_code = vk_create_command_pool(user_context, allocator, queue_family_index, &(entry->command_pool));
+    if (error_code == halide_error_code_success) {
+        error_code = vk_create_command_buffer(user_context, allocator, entry->command_pool, &(entry->command_buffer));
+    }
+    if (error_code == halide_error_code_success) {
+        VkFenceCreateInfo fence_info = {
+            VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,  // struct type
+            nullptr,                              // pointer to struct extending this
+            0                                     // flags
+        };
+        VkResult result = vkCreateFence(allocator->current_device(), &fence_info, allocator->callbacks(), &(entry->fence));
+        if (result != VK_SUCCESS) {
+            error(user_context) << "Vulkan: vkCreateFence returned " << vk_get_error_name(result) << "\n";
+            error_code = halide_error_code_generic_error;
+        }
+    }
+    if (error_code != halide_error_code_success) {
+        vk_destroy_command_resources(user_context, allocator, entry);
+        return error_code;
+    }
+    *out_entry = entry;
+    return halide_error_code_success;
+}
+
+void vk_recycle_command_resources(VulkanCommandResources *entry) {
+    ScopedSpinLock lock(&cached_command_resources_lock);
+    entry->next = cached_command_resources;
+    cached_command_resources = entry;
+}
+
 struct ScopedVulkanCommandBufferAndPool {
     void *user_context = nullptr;
     VulkanMemoryAllocator *allocator = nullptr;
-    VkCommandPool command_pool = VK_NULL_HANDLE;
+    VulkanCommandResources *entry = nullptr;
     VkCommandBuffer command_buffer = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     bool submitted = false;
@@ -223,81 +322,21 @@ struct ScopedVulkanCommandBufferAndPool {
 
     ScopedVulkanCommandBufferAndPool(void *uc, VulkanMemoryAllocator *vma, uint32_t queue_family_index)
         : user_context(uc), allocator(vma) {
-
-        VulkanCommandResources *entry = nullptr;
-        {
-            ScopedSpinLock lock(&cached_command_resources_lock);
-            VulkanCommandResources **prev_next = &cached_command_resources;
-            for (VulkanCommandResources *candidate = cached_command_resources; candidate != nullptr; candidate = candidate->next) {
-                if (!candidate->submitted || (vkGetFenceStatus(allocator->current_device(), candidate->fence) == VK_SUCCESS)) {
-                    *prev_next = candidate->next;
-                    entry = candidate;
-                    break;
-                }
-                prev_next = &(candidate->next);
-            }
-        }
-
-        if (entry != nullptr) {
-            command_pool = entry->command_pool;
+        error_code = vk_acquire_command_resources(user_context, allocator, queue_family_index, &entry);
+        if (error_code == halide_error_code_success) {
             command_buffer = entry->command_buffer;
             fence = entry->fence;
-            vk_host_free(user_context, entry, allocator->callbacks());
-            vkResetCommandPool(allocator->current_device(), command_pool, 0);
-            VkResult result = vkResetFences(allocator->current_device(), 1, &fence);
-            if (result != VK_SUCCESS) {
-                error(user_context) << "Vulkan: vkResetFences returned " << vk_get_error_name(result) << "\n";
-                error_code = halide_error_code_generic_error;
-            }
-            return;
-        }
-
-        error_code = vk_create_command_pool(user_context, allocator, queue_family_index, &command_pool);
-        if (error_code == halide_error_code_success) {
-            error_code = vk_create_command_buffer(user_context, allocator, command_pool, &command_buffer);
-        }
-        if (error_code == halide_error_code_success) {
-            VkFenceCreateInfo fence_info = {
-                VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,  // struct type
-                nullptr,                              // pointer to struct extending this
-                0                                     // flags
-            };
-            VkResult result = vkCreateFence(allocator->current_device(), &fence_info, allocator->callbacks(), &fence);
-            if (result != VK_SUCCESS) {
-                error(user_context) << "Vulkan: vkCreateFence returned " << vk_get_error_name(result) << "\n";
-                error_code = halide_error_code_generic_error;
-            }
         }
     }
 
     ~ScopedVulkanCommandBufferAndPool() {
-        if ((allocator != nullptr) && (command_pool != VK_NULL_HANDLE) && (command_buffer != VK_NULL_HANDLE) && (fence != VK_NULL_HANDLE)) {
-            VulkanCommandResources *entry = (VulkanCommandResources *)vk_host_malloc(user_context, sizeof(VulkanCommandResources), 0, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT, allocator->callbacks());
-            if (entry != nullptr) {
-                entry->command_pool = command_pool;
-                entry->command_buffer = command_buffer;
-                entry->fence = fence;
-                entry->submitted = submitted;
-                ScopedSpinLock lock(&cached_command_resources_lock);
-                entry->next = cached_command_resources;
-                cached_command_resources = entry;
-                command_pool = VK_NULL_HANDLE;
-                command_buffer = VK_NULL_HANDLE;
-                fence = VK_NULL_HANDLE;
-            }
-        }
-        if ((allocator != nullptr) && (command_pool != VK_NULL_HANDLE)) {
-            if (fence != VK_NULL_HANDLE) {
-                vkDestroyFence(allocator->current_device(), fence, allocator->callbacks());
-            }
-            if (command_buffer != VK_NULL_HANDLE) {
-                vk_destroy_command_buffer(user_context, allocator, command_pool, command_buffer);
-            }
-            vk_destroy_command_pool(user_context, allocator, command_pool);
+        if (entry != nullptr) {
+            entry->submitted = submitted;
+            vk_recycle_command_resources(entry);
         }
         user_context = nullptr;
         allocator = nullptr;
-        command_pool = VK_NULL_HANDLE;
+        entry = nullptr;
         command_buffer = VK_NULL_HANDLE;
         fence = VK_NULL_HANDLE;
     }
@@ -312,19 +351,58 @@ int vk_release_cached_command_resources(void *user_context, VulkanMemoryAllocato
     }
     while (entry != nullptr) {
         VulkanCommandResources *next = entry->next;
-        if (entry->fence != VK_NULL_HANDLE) {
-            vkDestroyFence(allocator->current_device(), entry->fence, allocator->callbacks());
-        }
-        if (entry->command_buffer != VK_NULL_HANDLE) {
-            vk_destroy_command_buffer(user_context, allocator, entry->command_pool, entry->command_buffer);
-        }
-        if (entry->command_pool != VK_NULL_HANDLE) {
-            vk_destroy_command_pool(user_context, allocator, entry->command_pool);
+        vk_destroy_command_resources(user_context, allocator, entry);
+        entry = next;
+    }
+    return halide_error_code_success;
+}
+
+// The currently recording command buffer in batched submission mode. Dispatches
+// are appended to it (with ordering barriers in between) and the whole batch is
+// submitted once at the first drain point, or whenever any other command buffer
+// needs to be submitted (submissions must reach the queue in program order).
+// Access is serialized by the context lock, like the submission serials.
+VulkanCommandResources *vk_open_batch_entry = nullptr;
+
+// Device regions whose release has been deferred until the queue drains, so a
+// device_free of a buffer still referenced by in-flight or recorded-but-not-yet
+// -submitted work does not have to block. Regions on this list remain owned by
+// this list (not the allocator's free pool) until the drain point processes it.
+struct VulkanDeferredRegionFree {
+    MemoryRegion *region = nullptr;
+    bool release = false;
+    VulkanDeferredRegionFree *next = nullptr;
+};
+
+VulkanDeferredRegionFree *vk_deferred_region_frees = nullptr;
+
+int vk_defer_region_free(void *user_context, VulkanMemoryAllocator *allocator, MemoryRegion *region) {
+    VulkanDeferredRegionFree *entry = (VulkanDeferredRegionFree *)vk_host_malloc(user_context, sizeof(VulkanDeferredRegionFree), 0, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT, allocator->callbacks());
+    if (entry == nullptr) {
+        error(user_context) << "Vulkan: Failed to allocate deferred region free entry!\n";
+        return halide_error_code_out_of_memory;
+    }
+    entry->region = region;
+    entry->release = halide_can_reuse_device_allocations(user_context);
+    entry->next = vk_deferred_region_frees;
+    vk_deferred_region_frees = entry;
+    return halide_error_code_success;
+}
+
+void vk_mark_queue_drained(void *user_context, VulkanMemoryAllocator *allocator) {
+    vk_mark_queue_drained();
+    VulkanDeferredRegionFree *entry = vk_deferred_region_frees;
+    vk_deferred_region_frees = nullptr;
+    while (entry != nullptr) {
+        VulkanDeferredRegionFree *next = entry->next;
+        if (entry->release) {
+            allocator->release(user_context, entry->region);
+        } else {
+            allocator->reclaim(user_context, entry->region);
         }
         vk_host_free(user_context, entry, allocator->callbacks());
         entry = next;
     }
-    return halide_error_code_success;
 }
 
 // Without a blocking wait after each submission, execution of separate command
@@ -350,15 +428,29 @@ void vk_record_ordering_barrier(void *user_context, VkCommandBuffer command_buff
                          0, 1, &memory_barrier, 0, nullptr, 0, nullptr);
 }
 
-// Wait for all previously submitted work on the queue to complete. When
-// spinning is enabled, an empty submission's fence stands in for
-// vkQueueWaitIdle (a fence signals only after all prior queue operations have
-// completed, and a spin-assisted fence wait avoids the disproportionately
-// expensive blocking wait on some drivers).
+// Wait for all previously submitted work on the queue to complete, after
+// flushing any open batch. A fence signals only after all prior queue
+// operations have completed, so waiting on the flushed batch's fence (or on an
+// empty submission's fence when there is no open batch) stands in for
+// vkQueueWaitIdle, and a spin-assisted fence wait avoids the
+// disproportionately expensive blocking wait on some drivers.
 int vk_sync_queue(void *user_context, VulkanMemoryAllocator *allocator, VkQueue queue, uint32_t queue_family_index) {
-    // With no runtime-submitted work pending, vkQueueWaitIdle returns quickly
-    // and still covers submissions made by external users of the queue.
-    if (vk_queue_has_pending_work() && (vk_wait_spin_us() > 0)) {
+    VkFence batch_fence = VK_NULL_HANDLE;
+    int error_code = vk_flush_open_batch(user_context, queue, &batch_fence);
+    if (error_code != halide_error_code_success) {
+        error(user_context) << "Vulkan: Failed to flush open batch!\n";
+        return error_code;
+    }
+
+    if ((batch_fence != VK_NULL_HANDLE) && (vk_wait_spin_us() > 0)) {
+        error_code = vk_wait_for_fence(user_context, allocator->current_device(), batch_fence);
+        if (error_code != halide_error_code_success) {
+            error(user_context) << "Vulkan: Failed to wait for queue sync to finish!\n";
+            return error_code;
+        }
+    } else if (vk_queue_has_pending_work() && (vk_wait_spin_us() > 0)) {
+        // With no runtime-submitted work pending, vkQueueWaitIdle returns quickly
+        // and still covers submissions made by external users of the queue.
         ScopedVulkanCommandBufferAndPool cmds(user_context, allocator, queue_family_index);
         if (cmds.error_code != halide_error_code_success) {
             error(user_context) << "Vulkan: Failed to create command buffer and pool!\n";
@@ -381,7 +473,7 @@ int vk_sync_queue(void *user_context, VulkanMemoryAllocator *allocator, VkQueue 
             error(user_context) << "Vulkan: vkEndCommandBuffer returned " << vk_get_error_name(result) << "\n";
             return halide_error_code_generic_error;
         }
-        int error_code = vk_submit_command_buffer(user_context, queue, cmds.command_buffer, cmds.fence);
+        error_code = vk_submit_command_buffer(user_context, queue, cmds.command_buffer, cmds.fence);
         if (error_code != halide_error_code_success) {
             error(user_context) << "Vulkan: Failed to submit command buffer!\n";
             return error_code;
@@ -398,7 +490,7 @@ int vk_sync_queue(void *user_context, VulkanMemoryAllocator *allocator, VkQueue 
             return halide_error_code_generic_error;
         }
     }
-    vk_mark_queue_drained();
+    vk_mark_queue_drained(user_context, allocator);
     return halide_error_code_success;
 }
 
@@ -467,6 +559,15 @@ int vk_submit_command_buffer(void *user_context, VkQueue queue, VkCommandBuffer 
         << "fence: " << (void *)fence << ")\n";
 #endif
 
+    // Any open batch must reach the queue first: its recorded dispatches
+    // precede this command buffer in program order, and the ordering barriers
+    // only order against previously *submitted* work.
+    int error_code = vk_flush_open_batch(user_context, queue, nullptr);
+    if (error_code != halide_error_code_success) {
+        error(user_context) << "Vulkan: Failed to flush open batch!\n";
+        return error_code;
+    }
+
     VkSubmitInfo submit_info =
         {
             VK_STRUCTURE_TYPE_SUBMIT_INFO,  // struct type
@@ -485,6 +586,101 @@ int vk_submit_command_buffer(void *user_context, VkQueue queue, VkCommandBuffer 
         error(user_context) << "Vulkan: vkQueueSubmit returned " << vk_get_error_name(result) << "\n";
         return halide_error_code_generic_error;
     }
+    return halide_error_code_success;
+}
+
+// Submit the currently recording batch (if any). The batch entry is detached
+// before submission so the flush inside vk_submit_command_buffer terminates.
+// The entry is recycled immediately: freelist reuse requires its fence to have
+// signalled, and out_fence stays valid for the caller to wait on because
+// nothing else can acquire it while the context lock is held.
+int vk_flush_open_batch(void *user_context, VkQueue queue, VkFence *out_fence) {
+    if (out_fence != nullptr) {
+        *out_fence = VK_NULL_HANDLE;
+    }
+    if (vk_open_batch_entry == nullptr) {
+        return halide_error_code_success;
+    }
+
+    VulkanCommandResources *entry = vk_open_batch_entry;
+    vk_open_batch_entry = nullptr;
+
+#ifdef DEBUG_RUNTIME
+    debug(user_context)
+        << " vk_flush_open_batch (user_context: " << user_context << ", "
+        << "queue: " << (void *)queue << ", "
+        << "command_buffer: " << (void *)entry->command_buffer << ")\n";
+#endif
+
+    VkResult result = vkEndCommandBuffer(entry->command_buffer);
+    if (result != VK_SUCCESS) {
+        error(user_context) << "Vulkan: vkEndCommandBuffer returned " << vk_get_error_name(result) << "\n";
+        vk_recycle_command_resources(entry);
+        return halide_error_code_generic_error;
+    }
+
+    int error_code = vk_submit_command_buffer(user_context, queue, entry->command_buffer, entry->fence);
+    if (error_code != halide_error_code_success) {
+        error(user_context) << "Vulkan: Failed to submit batched command buffer!\n";
+        vk_recycle_command_resources(entry);
+        return error_code;
+    }
+
+    entry->submitted = true;
+    if (out_fence != nullptr) {
+        *out_fence = entry->fence;
+    }
+    vk_recycle_command_resources(entry);
+    return halide_error_code_success;
+}
+
+// Append a dispatch to the currently recording batch, opening a new one if
+// necessary. The recorded work is only submitted at the next flush point.
+int vk_batch_dispatch(void *user_context,
+                      VulkanMemoryAllocator *allocator,
+                      uint32_t queue_family_index,
+                      VkPipeline compute_pipeline,
+                      VkPipelineLayout pipeline_layout,
+                      VkDescriptorSet descriptor_set,
+                      uint32_t descriptor_set_index,
+                      int blocksX, int blocksY, int blocksZ) {
+    if (vk_open_batch_entry == nullptr) {
+        VulkanCommandResources *entry = nullptr;
+        int error_code = vk_acquire_command_resources(user_context, allocator, queue_family_index, &entry);
+        if (error_code != halide_error_code_success) {
+            error(user_context) << "Vulkan: Failed to acquire command resources for batch!\n";
+            return error_code;
+        }
+        VkCommandBufferBeginInfo command_buffer_begin_info =
+            {
+                VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,  // struct type
+                nullptr,                                      // pointer to struct extending this
+                VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,  // flags
+                nullptr                                       // pointer to parent command buffer
+            };
+        VkResult result = vkBeginCommandBuffer(entry->command_buffer, &command_buffer_begin_info);
+        if (result != VK_SUCCESS) {
+            error(user_context) << "Vulkan: vkBeginCommandBuffer returned " << vk_get_error_name(result) << "\n";
+            vk_recycle_command_resources(entry);
+            return halide_error_code_generic_error;
+        }
+        vk_open_batch_entry = entry;
+    }
+
+#ifdef DEBUG_RUNTIME
+    debug(user_context)
+        << " vk_batch_dispatch (user_context: " << user_context << ", "
+        << "command_buffer: " << (void *)vk_open_batch_entry->command_buffer << ", "
+        << "descriptor_set: " << (void *)descriptor_set << ", "
+        << "blocks: " << blocksX << ", " << blocksY << ", " << blocksZ << ")\n";
+#endif
+
+    VkCommandBuffer command_buffer = vk_open_batch_entry->command_buffer;
+    vk_record_ordering_barrier(user_context, command_buffer);
+    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, compute_pipeline);
+    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout,
+                            descriptor_set_index, 1, &descriptor_set, 0, nullptr);
+    vkCmdDispatch(command_buffer, blocksX, blocksY, blocksZ);
     return halide_error_code_success;
 }
 
@@ -1147,6 +1343,8 @@ int vk_create_compute_pipeline(void *user_context,
 
 int vk_setup_compute_pipeline(void *user_context,
                               VulkanMemoryAllocator *allocator,
+                              VkQueue queue,
+                              uint32_t queue_family_index,
                               VulkanShaderBinding *shader_bindings,
                               VulkanDispatchData *dispatch_data,
                               VkShaderModule shader_module,
@@ -1299,6 +1497,17 @@ int vk_setup_compute_pipeline(void *user_context,
 
     if (dispatch_constant_count > 0) {
 
+        // Re-use the existing pipeline if it was specialized with the same
+        // dispatch constants ... otherwise recreating it costs a driver-side
+        // shader compile on every single dispatch.
+        bool pipeline_matches = (shader_bindings->compute_pipeline != VK_NULL_HANDLE) &&
+                                (shader_bindings->pipeline_dispatch_constant_count == dispatch_constant_count) &&
+                                (memcmp(shader_bindings->pipeline_dispatch_constant_ids, dispatch_constant_ids, sizeof(dispatch_constant_ids)) == 0) &&
+                                (memcmp(shader_bindings->pipeline_dispatch_constant_values, dispatch_constant_values, sizeof(dispatch_constant_values)) == 0);
+        if (pipeline_matches) {
+            return halide_error_code_success;
+        }
+
         // Prepare specialization info block for the shader stage
         VkSpecializationInfo specialization_info{};
         specialization_info.dataSize = dispatch_constant_count * sizeof(uint32_t);
@@ -1308,6 +1517,13 @@ int vk_setup_compute_pipeline(void *user_context,
 
         // Recreate the pipeline with the requested shared memory allocation
         if (shader_bindings->compute_pipeline) {
+            if (shader_bindings->pipeline_submit_serial > vk_queue_drained_serial) {
+                int error_code = vk_sync_queue_if_pending(user_context, allocator, queue, queue_family_index);
+                if (error_code != halide_error_code_success) {
+                    error(user_context) << "Vulkan: Failed to sync queue before recreating pipeline!\n";
+                    return error_code;
+                }
+            }
             int error_code = vk_destroy_compute_pipeline(user_context, allocator, shader_bindings->compute_pipeline);
             if (error_code != halide_error_code_success) {
                 error(user_context) << "Vulkan: Failed to destroy compute pipeline!\n";
@@ -1321,6 +1537,10 @@ int vk_setup_compute_pipeline(void *user_context,
             error(user_context) << "Vulkan: Failed to create compute pipeline!\n";
             return error_code;
         }
+
+        shader_bindings->pipeline_dispatch_constant_count = dispatch_constant_count;
+        memcpy(shader_bindings->pipeline_dispatch_constant_ids, dispatch_constant_ids, sizeof(dispatch_constant_ids));
+        memcpy(shader_bindings->pipeline_dispatch_constant_values, dispatch_constant_values, sizeof(dispatch_constant_values));
 
     } else {
 
@@ -1907,15 +2127,19 @@ void vk_destroy_compiled_shader_module(VulkanCompiledShaderModule *shader_module
             } else {
                 debug(user_context) << "<unknown entry point>\n";
             }
-            if (shader_module->shader_bindings[n].args_region) {
-                debug(user_context) << "  destroying shader binding args regions [" << n << "]\n";
-                vk_destroy_scalar_uniform_buffer(user_context, allocator, shader_module->shader_bindings[n].args_region);
-                shader_module->shader_bindings[n].args_region = nullptr;
-            }
-            if (shader_module->shader_bindings[n].descriptor_pool) {
-                debug(user_context) << "  destroying shader binding descriptor pool [" << n << "]\n";
-                vk_destroy_descriptor_pool(user_context, allocator, shader_module->shader_bindings[n].descriptor_pool);
-                shader_module->shader_bindings[n].descriptor_pool = VK_NULL_HANDLE;
+            for (uint32_t dr = 0; dr < vk_max_inflight_dispatches; dr++) {
+                VulkanDispatchResources *dispatch_resources = &(shader_module->shader_bindings[n].dispatch_resources[dr]);
+                if (dispatch_resources->args_region) {
+                    debug(user_context) << "  destroying shader binding args region [" << n << "." << dr << "]\n";
+                    vk_destroy_scalar_uniform_buffer(user_context, allocator, dispatch_resources->args_region);
+                    dispatch_resources->args_region = nullptr;
+                }
+                if (dispatch_resources->descriptor_pool) {
+                    debug(user_context) << "  destroying shader binding descriptor pool [" << n << "." << dr << "]\n";
+                    vk_destroy_descriptor_pool(user_context, allocator, dispatch_resources->descriptor_pool);
+                    dispatch_resources->descriptor_pool = VK_NULL_HANDLE;
+                    dispatch_resources->descriptor_set = VK_NULL_HANDLE;
+                }
             }
             if (shader_module->shader_bindings[n].specialization_constants) {
                 debug(user_context) << "  destroying shader binding specialization constants [" << n << "]\n";

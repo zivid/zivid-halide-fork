@@ -56,6 +56,7 @@ int vk_get_env_int(const char *name, int default_value) {
 // NOTE: no function-local statics here — the runtime is built without
 // __cxa_guard support, so lazily-initialized globals are used instead.
 int vk_cached_async_submission_env = -1;
+int vk_cached_batched_submission_env = -1;
 int vk_cached_wait_spin_us_env = -1;
 int vk_cached_clear_on_alloc_env = -1;
 int vk_cached_robust_buffer_access_env = -1;
@@ -67,6 +68,16 @@ bool vk_use_async_submission() {
         vk_cached_async_submission_env = (vk_get_env_int("HL_VK_ASYNC", 1) != 0) ? 1 : 0;
     }
     return vk_cached_async_submission_env != 0;
+}
+
+// Record all dispatches between two sync points into a single command buffer and
+// submit it at the first drain point, instead of one submission per dispatch.
+// Requires async submission. Disable with HL_VK_BATCH=0.
+bool vk_use_batched_submission() {
+    if (vk_cached_batched_submission_env < 0) {
+        vk_cached_batched_submission_env = (vk_get_env_int("HL_VK_BATCH", 1) != 0) ? 1 : 0;
+    }
+    return vk_use_async_submission() && (vk_cached_batched_submission_env != 0);
 }
 
 // Max time to busy-poll a fence before falling back to a blocking wait.
@@ -207,6 +218,21 @@ int vk_fill_command_buffer_with_dispatch_call(void *user_context,
 
 int vk_submit_command_buffer(void *user_context, VkQueue queue, VkCommandBuffer command_buffer, VkFence fence);
 
+int vk_flush_open_batch(void *user_context, VkQueue queue, VkFence *out_fence);
+
+int vk_batch_dispatch(void *user_context,
+                      VulkanMemoryAllocator *allocator,
+                      uint32_t queue_family_index,
+                      VkPipeline compute_pipeline,
+                      VkPipelineLayout pipeline_layout,
+                      VkDescriptorSet descriptor_set,
+                      uint32_t descriptor_set_index,
+                      int blocksX, int blocksY, int blocksZ);
+
+int vk_defer_region_free(void *user_context, VulkanMemoryAllocator *allocator, MemoryRegion *region);
+
+void vk_mark_queue_drained(void *user_context, VulkanMemoryAllocator *allocator);
+
 int vk_wait_for_fence(void *user_context, VkDevice device, VkFence fence);
 
 void vk_record_ordering_barrier(void *user_context, VkCommandBuffer command_buffer);
@@ -306,6 +332,8 @@ int vk_create_compute_pipeline(void *user_context,
 
 int vk_setup_compute_pipeline(void *user_context,
                               VulkanMemoryAllocator *allocator,
+                              VkQueue queue,
+                              uint32_t queue_family_index,
                               VulkanShaderBinding *shader_bindings,
                               VkShaderModule shader_module,
                               VkPipelineLayout pipeline_layout,

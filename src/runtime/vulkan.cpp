@@ -108,18 +108,20 @@ WEAK int halide_vulkan_device_free(void *user_context, halide_buffer_t *halide_b
     uint64_t t_before = halide_current_time_ns(user_context);
 #endif
 
-    // the buffer (or a region recycled from it) may still be used by queued work
-    int error_code = vk_sync_queue_if_pending(user_context, ctx.allocator, ctx.queue, ctx.queue_family_index);
-    if (error_code != halide_error_code_success) {
-        error(user_context) << "Vulkan: Failed to sync queue before releasing device buffer!\n";
-        return error_code;
-    }
-
     // get the allocated region for the device
     MemoryRegion *device_region = reinterpret_cast<MemoryRegion *>(halide_buffer->device);
     MemoryRegion *memory_region = ctx.allocator->owner_of(user_context, device_region);
     if (ctx.allocator && memory_region && memory_region->handle) {
-        if (halide_can_reuse_device_allocations(user_context)) {
+        if (vk_queue_has_pending_work()) {
+            // The buffer (or a region recycled from it) may still be used by
+            // queued or recorded work ... defer the release until the queue
+            // drains instead of blocking here.
+            int error_code = vk_defer_region_free(user_context, ctx.allocator, memory_region);
+            if (error_code != halide_error_code_success) {
+                error(user_context) << "Vulkan: Failed to defer device buffer release!\n";
+                return error_code;
+            }
+        } else if (halide_can_reuse_device_allocations(user_context)) {
             ctx.allocator->release(user_context, memory_region);
         } else {
             ctx.allocator->reclaim(user_context, memory_region);
@@ -287,7 +289,13 @@ WEAK int halide_vulkan_device_malloc(void *user_context, halide_buffer_t *buf) {
             return halide_error_code_success;
         } else {
             debug(user_context) << "Vulkan: Requested allocation of different size ... reallocating buffer!\n";
-            if (halide_can_reuse_device_allocations(user_context)) {
+            if (vk_queue_has_pending_work()) {
+                int error_code = vk_defer_region_free(user_context, ctx.allocator, device_region);
+                if (error_code != halide_error_code_success) {
+                    error(user_context) << "Vulkan: Failed to defer device buffer release!\n";
+                    return error_code;
+                }
+            } else if (halide_can_reuse_device_allocations(user_context)) {
                 ctx.allocator->release(user_context, device_region);
             } else {
                 ctx.allocator->reclaim(user_context, device_region);
@@ -575,7 +583,7 @@ WEAK int halide_vulkan_copy_to_device(void *user_context, halide_buffer_t *halid
         error(user_context) << "Vulkan: Failed to wait for copy to finish!\n";
         return halide_error_code_device_buffer_copy_failed;
     }
-    vk_mark_queue_drained();
+    vk_mark_queue_drained(user_context, ctx.allocator);
 
     //// 15. Reclaim the staging buffer
     if (halide_can_reuse_device_allocations(user_context)) {
@@ -771,7 +779,7 @@ WEAK int halide_vulkan_copy_to_host(void *user_context, halide_buffer_t *halide_
         error(user_context) << "Vulkan: Failed to wait for copy to finish!\n";
         return halide_error_code_copy_to_device_failed;
     }
-    vk_mark_queue_drained();
+    vk_mark_queue_drained(user_context, ctx.allocator);
 
     // map the staging region to a host ptr
     uint8_t *stage_host_ptr = (uint8_t *)ctx.allocator->map(user_context, staging_region);
@@ -860,17 +868,17 @@ WEAK int halide_vulkan_buffer_copy(void *user_context, struct halide_buffer_t *s
         MemoryRegion *src_buffer_region = nullptr;
         MemoryRegion *dst_buffer_region = nullptr;
 
-        //// wait until the queue is done with the command buffer
-        VkResult wait_result = vkQueueWaitIdle(ctx.queue);
-        if (wait_result != VK_SUCCESS) {
-            error(user_context) << "Vulkan: vkQueueWaitIdle returned " << vk_get_error_name(wait_result) << "\n";
+        //// wait until the queue is done with all pending work (including any
+        //// open batch, which vk_sync_queue flushes first)
+        int wait_error_code = vk_sync_queue(user_context, ctx.allocator, ctx.queue, ctx.queue_family_index);
+        if (wait_error_code != halide_error_code_success) {
+            error(user_context) << "Vulkan: Failed to sync queue before buffer copy!\n";
             if (to_host) {
                 return halide_error_code_copy_to_host_failed;
             } else {
                 return halide_error_code_copy_to_device_failed;
             }
         }
-        vk_mark_queue_drained();
 
         int error_code = halide_error_code_success;
         if (!from_host && !to_host) {
@@ -1048,7 +1056,7 @@ WEAK int halide_vulkan_buffer_copy(void *user_context, struct halide_buffer_t *s
             error(user_context) << "Vulkan: Failed to wait for copy to finish!\n";
             return error_code;
         }
-        vk_mark_queue_drained();
+        vk_mark_queue_drained(user_context, ctx.allocator);
 
         if (!from_host && to_host) {
             // map the staging region to a host ptr
@@ -1278,25 +1286,29 @@ WEAK int halide_vulkan_run(void *user_context,
 
     VulkanShaderBinding *entry_point_binding = (shader_module->shader_bindings + entry_point_index);
 
-    // If a previous asynchronous submission of this entry point is still in flight,
-    // its pipeline, descriptor set and uniform args buffer cannot be modified yet.
-    if (entry_point_binding->submit_serial > vk_queue_drained_serial) {
+    // Each entry point keeps a ring of per-dispatch resources (descriptor set
+    // and uniform args buffer) so repeated dispatches of the same kernel can
+    // be batched without draining the queue. Only when the ring wraps onto a
+    // slot whose submission is still in flight does the queue need a sync.
+    VulkanDispatchResources *dispatch_resources = &(entry_point_binding->dispatch_resources[entry_point_binding->next_dispatch_resource]);
+    entry_point_binding->next_dispatch_resource = (entry_point_binding->next_dispatch_resource + 1) % vk_max_inflight_dispatches;
+    if (dispatch_resources->submit_serial > vk_queue_drained_serial) {
         error_code = vk_sync_queue_if_pending(user_context, ctx.allocator, ctx.queue, ctx.queue_family_index);
         if (error_code != halide_error_code_success) {
-            error(user_context) << "Vulkan: Failed to sync queue before reusing entry point!\n";
+            error(user_context) << "Vulkan: Failed to sync queue before reusing dispatch resources!\n";
             return error_code;
         }
     }
 
     // 2c. Setup the compute pipeline (eg override any specializations for shared mem or workgroup size)
-    error_code = vk_setup_compute_pipeline(user_context, ctx.allocator, entry_point_binding, &dispatch_data, shader_module->shader_module, shader_module->pipeline_layout, &(entry_point_binding->compute_pipeline));
+    error_code = vk_setup_compute_pipeline(user_context, ctx.allocator, ctx.queue, ctx.queue_family_index, entry_point_binding, &dispatch_data, shader_module->shader_module, shader_module->pipeline_layout, &(entry_point_binding->compute_pipeline));
     if (error_code != halide_error_code_success) {
         error(user_context) << "Vulkan: Failed to setup compute pipeline!\n";
         return error_code;
     }
 
     // 2d. Create a descriptor set
-    if (entry_point_binding->descriptor_set == VK_NULL_HANDLE) {
+    if (dispatch_resources->descriptor_set == VK_NULL_HANDLE) {
 
         // Construct a descriptor pool
         //
@@ -1305,14 +1317,14 @@ WEAK int halide_vulkan_run(void *user_context,
 
         uint32_t uniform_buffer_count = entry_point_binding->uniform_buffer_count;
         uint32_t storage_buffer_count = entry_point_binding->storage_buffer_count;
-        error_code = vk_create_descriptor_pool(user_context, ctx.allocator, uniform_buffer_count, storage_buffer_count, &(entry_point_binding->descriptor_pool));
+        error_code = vk_create_descriptor_pool(user_context, ctx.allocator, uniform_buffer_count, storage_buffer_count, &(dispatch_resources->descriptor_pool));
         if (error_code != halide_error_code_success) {
             error(user_context) << "Vulkan: Unable to create shader module ... failed to create descriptor pool!\n";
             return error_code;
         }
 
         // Create the descriptor set
-        error_code = vk_create_descriptor_set(user_context, ctx.allocator, shader_module->descriptor_set_layouts[entry_point_index], entry_point_binding->descriptor_pool, &(entry_point_binding->descriptor_set));
+        error_code = vk_create_descriptor_set(user_context, ctx.allocator, shader_module->descriptor_set_layouts[entry_point_index], dispatch_resources->descriptor_pool, &(dispatch_resources->descriptor_set));
         if (error_code != halide_error_code_success) {
             error(user_context) << "Vulkan: Unable to create shader module ... failed to create descriptor set!\n";
             return error_code;
@@ -1320,11 +1332,11 @@ WEAK int halide_vulkan_run(void *user_context,
     }
 
     // 3a. Create a buffer for the scalar parameters
-    if ((entry_point_binding->args_region == nullptr) && entry_point_binding->uniform_buffer_count) {
+    if ((dispatch_resources->args_region == nullptr) && entry_point_binding->uniform_buffer_count) {
         size_t scalar_buffer_size = vk_estimate_scalar_uniform_buffer_size(user_context, arg_sizes, args, arg_is_buffer);
         if (scalar_buffer_size > 0) {
-            entry_point_binding->args_region = vk_create_scalar_uniform_buffer(user_context, ctx.allocator, scalar_buffer_size);
-            if (entry_point_binding->args_region == nullptr) {
+            dispatch_resources->args_region = vk_create_scalar_uniform_buffer(user_context, ctx.allocator, scalar_buffer_size);
+            if (dispatch_resources->args_region == nullptr) {
                 error(user_context) << "Vulkan: Failed to create scalar uniform buffer!\n";
                 return halide_error_code_out_of_memory;
             }
@@ -1333,14 +1345,14 @@ WEAK int halide_vulkan_run(void *user_context,
 
     // 3b. Update uniform buffer with scalar parameters
     VkBuffer *args_buffer = nullptr;
-    if ((entry_point_binding->args_region != nullptr) && entry_point_binding->uniform_buffer_count) {
-        error_code = vk_update_scalar_uniform_buffer(user_context, ctx.allocator, entry_point_binding->args_region, arg_sizes, args, arg_is_buffer);
+    if ((dispatch_resources->args_region != nullptr) && entry_point_binding->uniform_buffer_count) {
+        error_code = vk_update_scalar_uniform_buffer(user_context, ctx.allocator, dispatch_resources->args_region, arg_sizes, args, arg_is_buffer);
         if (error_code != halide_error_code_success) {
             error(user_context) << "Vulkan: Failed to update scalar uniform buffer!\n";
             return error_code;
         }
 
-        args_buffer = reinterpret_cast<VkBuffer *>(entry_point_binding->args_region->handle);
+        args_buffer = reinterpret_cast<VkBuffer *>(dispatch_resources->args_region->handle);
         if (args_buffer == nullptr) {
             error(user_context) << "Vulkan: Failed to retrieve scalar args buffer for device memory!\n";
             return halide_error_code_internal_error;
@@ -1348,52 +1360,71 @@ WEAK int halide_vulkan_run(void *user_context,
     }
 
     // 3c. Update buffer bindings for descriptor set
-    error_code = vk_update_descriptor_set(user_context, ctx.allocator, args_buffer, entry_point_binding->uniform_buffer_count, entry_point_binding->storage_buffer_count, arg_sizes, args, arg_is_buffer, entry_point_binding->descriptor_set);
+    error_code = vk_update_descriptor_set(user_context, ctx.allocator, args_buffer, entry_point_binding->uniform_buffer_count, entry_point_binding->storage_buffer_count, arg_sizes, args, arg_is_buffer, dispatch_resources->descriptor_set);
     if (error_code != halide_error_code_success) {
         error(user_context) << "Vulkan: Failed to update descriptor set!\n";
         return error_code;
     }
 
-    // 4. Create a command buffer and pool
-    ScopedVulkanCommandBufferAndPool cmds(user_context, ctx.allocator, ctx.queue_family_index);
-    if (cmds.error_code != halide_error_code_success) {
-        error(user_context) << "Vulkan: Failed to create command buffer and pool!\n";
-        return cmds.error_code;
-    }
-
-    // 5. Fill the command buffer
-    error_code = vk_fill_command_buffer_with_dispatch_call(user_context,
-                                                           ctx.device, cmds.command_buffer,
-                                                           entry_point_binding->compute_pipeline,
-                                                           shader_module->pipeline_layout,
-                                                           entry_point_binding->descriptor_set,
-                                                           entry_point_index,
-                                                           blocksX, blocksY, blocksZ);
-    if (error_code != halide_error_code_success) {
-        error(user_context) << "Vulkan: Failed to fill command buffer with dispatch call!\n";
-        return error_code;
-    }
-
-    // 6. Submit the command buffer to our command queue
-    error_code = vk_submit_command_buffer(user_context, ctx.queue, cmds.command_buffer, cmds.fence);
-    if (error_code != halide_error_code_success) {
-        error(user_context) << "Vulkan: Failed to fill submit command buffer!\n";
-        return error_code;
-    }
-
-    // 7. Either defer completion (async submission mode: sync happens at
-    //    device_sync, copies, frees, or reuse of this entry point), or wait
-    //    for the fence right away.
-    if (vk_use_async_submission()) {
-        cmds.submitted = true;
-        entry_point_binding->submit_serial = vk_next_submit_serial();
-    } else {
-        error_code = vk_wait_for_fence(user_context, ctx.device, cmds.fence);
+    if (vk_use_batched_submission()) {
+        // 4-7. Append the dispatch to the currently recording batch. Submission
+        //      happens at the next drain point (device_sync, copies, frees, or
+        //      reuse of this entry point).
+        error_code = vk_batch_dispatch(user_context, ctx.allocator, ctx.queue_family_index,
+                                       entry_point_binding->compute_pipeline,
+                                       shader_module->pipeline_layout,
+                                       dispatch_resources->descriptor_set,
+                                       entry_point_index,
+                                       blocksX, blocksY, blocksZ);
         if (error_code != halide_error_code_success) {
-            error(user_context) << "Vulkan: Failed to wait for dispatch to finish!\n";
+            error(user_context) << "Vulkan: Failed to record dispatch call into batch!\n";
             return error_code;
         }
-        vk_mark_queue_drained();
+        dispatch_resources->submit_serial = vk_next_submit_serial();
+        entry_point_binding->pipeline_submit_serial = dispatch_resources->submit_serial;
+    } else {
+        // 4. Create a command buffer and pool
+        ScopedVulkanCommandBufferAndPool cmds(user_context, ctx.allocator, ctx.queue_family_index);
+        if (cmds.error_code != halide_error_code_success) {
+            error(user_context) << "Vulkan: Failed to create command buffer and pool!\n";
+            return cmds.error_code;
+        }
+
+        // 5. Fill the command buffer
+        error_code = vk_fill_command_buffer_with_dispatch_call(user_context,
+                                                               ctx.device, cmds.command_buffer,
+                                                               entry_point_binding->compute_pipeline,
+                                                               shader_module->pipeline_layout,
+                                                               dispatch_resources->descriptor_set,
+                                                               entry_point_index,
+                                                               blocksX, blocksY, blocksZ);
+        if (error_code != halide_error_code_success) {
+            error(user_context) << "Vulkan: Failed to fill command buffer with dispatch call!\n";
+            return error_code;
+        }
+
+        // 6. Submit the command buffer to our command queue
+        error_code = vk_submit_command_buffer(user_context, ctx.queue, cmds.command_buffer, cmds.fence);
+        if (error_code != halide_error_code_success) {
+            error(user_context) << "Vulkan: Failed to fill submit command buffer!\n";
+            return error_code;
+        }
+
+        // 7. Either defer completion (async submission mode: sync happens at
+        //    device_sync, copies, frees, or reuse of this entry point), or wait
+        //    for the fence right away.
+        if (vk_use_async_submission()) {
+            cmds.submitted = true;
+            dispatch_resources->submit_serial = vk_next_submit_serial();
+            entry_point_binding->pipeline_submit_serial = dispatch_resources->submit_serial;
+        } else {
+            error_code = vk_wait_for_fence(user_context, ctx.device, cmds.fence);
+            if (error_code != halide_error_code_success) {
+                error(user_context) << "Vulkan: Failed to wait for dispatch to finish!\n";
+                return error_code;
+            }
+            vk_mark_queue_drained(user_context, ctx.allocator);
+        }
     }
 
 #ifdef DEBUG_RUNTIME
