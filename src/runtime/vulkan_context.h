@@ -436,6 +436,16 @@ int vk_create_device(void *user_context, const StringTable &requested_layers, Vk
         standard_features_ptr = &device_features;  // pass v1.0 standard features
     }
 
+    // Enabling every supported feature implicitly turned on robustBufferAccess,
+    // which makes some drivers (Mesa ANV) generate bounds-checked code for every
+    // buffer access at a substantial bandwidth/ALU cost. Halide kernels stay in
+    // bounds by construction (and the CUDA/OpenCL backends treat out-of-bounds
+    // access as UB), so it is disabled unless explicitly requested.
+    if (!vk_use_robust_buffer_access()) {
+        device_features.robustBufferAccess = VK_FALSE;
+        device_features_ext.features.robustBufferAccess = VK_FALSE;
+    }
+
     VkDeviceCreateInfo device_create_info = {
         VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         extended_features_ptr,  // Extended struct ptr (used here for requesting chain of extended features)

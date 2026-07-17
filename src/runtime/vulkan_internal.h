@@ -58,6 +58,7 @@ int vk_get_env_int(const char *name, int default_value) {
 int vk_cached_async_submission_env = -1;
 int vk_cached_wait_spin_us_env = -1;
 int vk_cached_clear_on_alloc_env = -1;
+int vk_cached_robust_buffer_access_env = -1;
 
 // Submit dispatches without blocking on completion (sync happens on device_sync,
 // copies, frees, or reuse of the same kernel's uniform buffer). Disable with HL_VK_ASYNC=0.
@@ -77,6 +78,18 @@ int vk_wait_spin_us() {
         vk_cached_wait_spin_us_env = (value < 0) ? 0 : value;
     }
     return vk_cached_wait_spin_us_env;
+}
+
+// Create the device with robustBufferAccess enabled (legacy behaviour: enabling
+// every supported device feature turned it on implicitly). Bounds-checked buffer
+// access costs real bandwidth/ALU on some drivers (Mesa ANV), and the CUDA and
+// OpenCL backends treat out-of-bounds access as UB anyway. Enable with
+// HL_VK_ROBUST_BUFFER_ACCESS=1.
+bool vk_use_robust_buffer_access() {
+    if (vk_cached_robust_buffer_access_env < 0) {
+        vk_cached_robust_buffer_access_env = (vk_get_env_int("HL_VK_ROBUST_BUFFER_ACCESS", 0) != 0) ? 1 : 0;
+    }
+    return vk_cached_robust_buffer_access_env != 0;
 }
 
 // Zero-fill device allocations on malloc (legacy behaviour; CUDA/OpenCL backends
