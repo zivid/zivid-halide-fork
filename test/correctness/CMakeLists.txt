@@ -239,6 +239,7 @@ tests(GROUPS correctness
       non_vector_aligned_embeded_buffer.cpp
       obscure_image_references.cpp
       opencl_allocation_cache.cpp
+      opencl_sub_buffer_crop.cpp
       out_constraint.cpp
       out_of_memory.cpp
       output_larger_than_two_gigs.cpp

@@ -1388,6 +1388,19 @@ WEAK int halide_opencl_run(void *user_context,
             uint64_t offset = ((device_handle *)((halide_buffer_t *)this_arg)->device)->offset;
 
             if (offset != 0) {
+                // OpenCL does not allow a sub-buffer of a sub-buffer, so a
+                // crop of a buffer that is itself a sub-buffer is made from
+                // its root buffer.
+                cl_mem root = nullptr;
+                err = clGetMemObjectInfo(mem, CL_MEM_ASSOCIATED_MEMOBJECT, sizeof(root), &root, nullptr);
+                if (err == CL_SUCCESS && root != nullptr) {
+                    size_t root_offset = 0;
+                    err = clGetMemObjectInfo(mem, CL_MEM_OFFSET, sizeof(root_offset), &root_offset, nullptr);
+                    offset += root_offset;
+                    mem = root;
+                }
+            }
+            if (offset != 0 && err == CL_SUCCESS) {
                 cl_buffer_region region = {(size_t)offset, ((halide_buffer_t *)this_arg)->size_in_bytes()};
                 // The sub-buffer encompasses the linear range of addresses that
                 // span the crop.
