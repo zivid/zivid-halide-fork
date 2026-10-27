@@ -90,6 +90,7 @@ WEAK int create_opencl_context(void *user_context, cl_context *ctx, cl_command_q
 // this module with weak linkage
 cl_context WEAK context = nullptr;
 cl_command_queue WEAK command_queue = nullptr;
+WEAK const halide_opencl_device_allocator_t *device_allocator = nullptr;
 volatile ScopedSpinLock::AtomicFlag WEAK thread_lock = 0;
 
 WEAK char platform_name[256];
@@ -761,6 +762,12 @@ WEAK int get_cacheable_allocation_size(void *user_context, const halide_buffer_t
 
 extern "C" {
 
+WEAK const halide_opencl_device_allocator_t *halide_set_opencl_device_allocator(const halide_opencl_device_allocator_t *allocator) {
+    const halide_opencl_device_allocator_t *result = OpenCL::device_allocator;
+    OpenCL::device_allocator = allocator;
+    return result;
+}
+
 WEAK int halide_opencl_device_free(void *user_context, halide_buffer_t *buf) {
     // halide_opencl_device_free, at present, can be exposed to clients and they
     // should be allowed to call halide_opencl_device_free on any halide_buffer_t
@@ -787,6 +794,17 @@ WEAK int halide_opencl_device_free(void *user_context, halide_buffer_t *buf) {
 
     auto result = validate_device_pointer(user_context, buf);
     if (result) {
+        return result;
+    }
+
+    const halide_opencl_device_allocator_t *allocator = OpenCL::device_allocator;
+    if (allocator && buf->device_interface == &opencl_device_interface) {
+        debug(user_context) << "    custom free " << (void *)dev_ptr << "\n";
+        result = allocator->free(user_context, ctx.context, ctx.cmd_queue, dev_ptr, buf->size_in_bytes());
+        free((device_handle *)buf->device);
+        buf->device = 0;
+        buf->device_interface->impl->release_module();
+        buf->device_interface = nullptr;
         return result;
     }
 
@@ -1015,7 +1033,8 @@ WEAK int halide_opencl_device_malloc(void *user_context, halide_buffer_t *buf) {
         return validate_device_pointer(user_context, buf, size);
     }
 
-    if (halide_can_reuse_device_allocations(user_context)) {
+    const halide_opencl_device_allocator_t *allocator = OpenCL::device_allocator;
+    if (!allocator && halide_can_reuse_device_allocations(user_context)) {
         size = quantize_allocation_size(size);
     }
 
@@ -1036,7 +1055,17 @@ WEAK int halide_opencl_device_malloc(void *user_context, halide_buffer_t *buf) {
 
     cl_mem dev_ptr = nullptr;
     FreeListItem *to_free = nullptr;
-    if (halide_can_reuse_device_allocations(user_context)) {
+    if (allocator) {
+        debug(user_context) << "    custom allocate " << (uint64_t)size << " -> ";
+        void *allocated = nullptr;
+        auto result = allocator->allocate(user_context, ctx.context, ctx.cmd_queue, size, &allocated);
+        if (result) {
+            free(dev_handle);
+            return result;
+        }
+        halide_abort_if_false(user_context, allocated != nullptr);
+        dev_ptr = (cl_mem)allocated;
+    } else if (halide_can_reuse_device_allocations(user_context)) {
         ScopedMutexLock lock(&free_list_lock);
         // Best-fit allocation. There are three tunable constants
         // here. A bucket is claimed if the size requested is at least

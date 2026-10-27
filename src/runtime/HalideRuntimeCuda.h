@@ -82,6 +82,24 @@ extern halide_cuda_release_context_t halide_set_cuda_release_context(halide_cuda
 extern halide_cuda_get_stream_t halide_set_cuda_get_stream(halide_cuda_get_stream_t handler);
 // @}
 
+/** Device memory for halide_cuda_device_malloc and halide_cuda_device_free.
+ * Both are called with the cuda context current, and with the stream from
+ * halide_cuda_get_stream. The memory may be released on that stream while
+ * work queued on it still uses the memory, so free must order the release
+ * after that work, for example with cuMemFreeAsync. size is the size of the
+ * buffer, and is the same in free as in the allocate it pairs with. */
+struct halide_cuda_device_allocator_t {
+    int (*allocate)(void *user_context, void *context, void *stream, size_t size, uint64_t *device_ptr_out);
+    int (*free)(void *user_context, void *context, void *stream, uint64_t device_ptr, size_t size);
+};
+
+/** Serve device allocations from allocator instead of cuMemAlloc, cuMemFree
+ * and the allocation cache, or restore those with nullptr. Change it only
+ * while no device memory allocated by the cuda runtime is alive, since
+ * memory is freed through the allocator in effect when it is freed. Returns
+ * the previous allocator. */
+extern const struct halide_cuda_device_allocator_t *halide_set_cuda_device_allocator(const struct halide_cuda_device_allocator_t *allocator);
+
 #ifdef __cplusplus
 }  // End extern "C"
 #endif

@@ -219,6 +219,7 @@ namespace CUDA {
 WEAK halide_cuda_acquire_context_t acquire_context = (halide_cuda_acquire_context_t)halide_default_cuda_acquire_context;
 WEAK halide_cuda_release_context_t release_context = (halide_cuda_release_context_t)halide_default_cuda_release_context;
 WEAK halide_cuda_get_stream_t get_stream = (halide_cuda_get_stream_t)halide_default_cuda_get_stream;
+WEAK const halide_cuda_device_allocator_t *device_allocator = nullptr;
 
 }  // namespace CUDA
 }  // namespace Internal
@@ -254,6 +255,12 @@ WEAK int halide_cuda_get_stream(void *user_context, CUcontext ctx, CUstream *str
 WEAK halide_cuda_get_stream_t halide_set_cuda_get_stream(halide_cuda_get_stream_t handler) {
     halide_cuda_get_stream_t result = CUDA::get_stream;
     CUDA::get_stream = handler;
+    return result;
+}
+
+WEAK const halide_cuda_device_allocator_t *halide_set_cuda_device_allocator(const halide_cuda_device_allocator_t *allocator) {
+    const halide_cuda_device_allocator_t *result = CUDA::device_allocator;
+    CUDA::device_allocator = allocator;
     return result;
 }
 }
@@ -665,7 +672,19 @@ WEAK int halide_cuda_device_free(void *user_context, halide_buffer_t *buf) {
     }
 
     CUresult err = CUDA_SUCCESS;
-    if (halide_can_reuse_device_allocations(user_context)) {
+    if (const halide_cuda_device_allocator_t *allocator = CUDA::device_allocator) {
+        CUstream stream = nullptr;
+        result = halide_cuda_get_stream(user_context, ctx.context, &stream);
+        if (result) {
+            return result;
+        }
+        debug(user_context) << "    custom free " << (void *)(dev_ptr) << "\n";
+        result = allocator->free(user_context, ctx.context, stream, dev_ptr, buf->size_in_bytes());
+        buf->device_interface->impl->release_module();
+        buf->device_interface = nullptr;
+        buf->device = 0;
+        return result;
+    } else if (halide_can_reuse_device_allocations(user_context)) {
         debug(user_context) << "    caching allocation for later use: " << (void *)(dev_ptr) << "\n";
 
         FreeListItem *item = (FreeListItem *)malloc(sizeof(FreeListItem));
@@ -777,8 +796,9 @@ WEAK int halide_cuda_device_malloc(void *user_context, halide_buffer_t *buf) {
         return ctx.error();
     }
 
+    const halide_cuda_device_allocator_t *allocator = CUDA::device_allocator;
     size_t size = buf->size_in_bytes();
-    if (halide_can_reuse_device_allocations(user_context)) {
+    if (!allocator && halide_can_reuse_device_allocations(user_context)) {
         size = quantize_allocation_size(size);
     }
     halide_abort_if_false(user_context, size != 0);
@@ -800,7 +820,21 @@ WEAK int halide_cuda_device_malloc(void *user_context, halide_buffer_t *buf) {
 
     CUdeviceptr p = 0;
     FreeListItem *to_free = nullptr;
-    if (halide_can_reuse_device_allocations(user_context)) {
+    if (allocator) {
+        CUstream stream = nullptr;
+        auto result = halide_cuda_get_stream(user_context, ctx.context, &stream);
+        if (result) {
+            return result;
+        }
+        debug(user_context) << "    custom allocate " << (uint64_t)size << " -> ";
+        uint64_t allocated = 0;
+        result = allocator->allocate(user_context, ctx.context, stream, size, &allocated);
+        if (result) {
+            return result;
+        }
+        p = (CUdeviceptr)allocated;
+        debug(user_context) << (void *)p << "\n";
+    } else if (halide_can_reuse_device_allocations(user_context)) {
         CUstream stream = nullptr;
         if (cuStreamSynchronize != nullptr) {
             auto result = halide_cuda_get_stream(user_context, ctx.context, &stream);

@@ -138,6 +138,7 @@ tests(GROUPS correctness
       gpu_cpu_simultaneous_read.cpp
       gpu_data_flows.cpp
       gpu_different_blocks_threads_dimensions.cpp
+      gpu_device_allocator.cpp
       gpu_dynamic_shared.cpp
       gpu_f16_intrinsics.cpp
       gpu_free_sync.cpp

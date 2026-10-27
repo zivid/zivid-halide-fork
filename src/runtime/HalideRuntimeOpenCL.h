@@ -38,10 +38,28 @@ extern int halide_opencl_run(void *user_context,
 extern void halide_opencl_finalize_kernels(void *user_context, void *state_ptr);
 // @}
 
-
 /** Release all currently-unused device allocations back to the OpenCL
  * driver. See halide_reuse_device_allocations. */
 extern int halide_opencl_release_unused_device_allocations(void *user_context);
+
+/** Device memory for buffers from halide_opencl_device_malloc, freed by
+ * halide_opencl_device_free. Images are not served by it. Both are called
+ * with the context and command queue from halide_acquire_cl_context, as
+ * cl_context, cl_command_queue and cl_mem cast to void *. Commands enqueued
+ * on that queue may still use the memory when it is freed, so free must not
+ * hand the memory out again before that work. size is the size of the
+ * buffer, and is the same in free as in the allocate it pairs with. */
+struct halide_opencl_device_allocator_t {
+    int (*allocate)(void *user_context, void *context, void *command_queue, size_t size, void **mem_out);
+    int (*free)(void *user_context, void *context, void *command_queue, void *mem, size_t size);
+};
+
+/** Serve buffer allocations from allocator instead of clCreateBuffer,
+ * clReleaseMemObject and the allocation cache, or restore those with
+ * nullptr. Change it only while no buffer allocated by the OpenCL runtime is
+ * alive, since a buffer is freed through the allocator in effect when it is
+ * freed. Returns the previous allocator. */
+extern const struct halide_opencl_device_allocator_t *halide_set_opencl_device_allocator(const struct halide_opencl_device_allocator_t *allocator);
 
 /** Set the platform name for OpenCL to use (e.g. "Intel" or
  * "NVIDIA"). The argument is copied internally. The opencl runtime
