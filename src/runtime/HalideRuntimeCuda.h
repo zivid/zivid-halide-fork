@@ -82,6 +82,12 @@ extern halide_cuda_release_context_t halide_set_cuda_release_context(halide_cuda
 extern halide_cuda_get_stream_t halide_set_cuda_get_stream(halide_cuda_get_stream_t handler);
 // @}
 
+/** Set the maximum number of registers per thread passed to the CUDA JIT
+ * (CU_JIT_MAX_REGISTERS) when compiling kernels. Only affects kernels
+ * compiled after the call. The HL_CUDA_JIT_MAX_REGISTERS environment
+ * variable takes precedence. The default is 64. Returns the previous value. */
+extern int halide_set_cuda_jit_max_registers(int max_registers);
+
 #ifdef __cplusplus
 }  // End extern "C"
 #endif

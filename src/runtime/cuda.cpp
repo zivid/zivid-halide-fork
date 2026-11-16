@@ -219,6 +219,7 @@ namespace CUDA {
 WEAK halide_cuda_acquire_context_t acquire_context = (halide_cuda_acquire_context_t)halide_default_cuda_acquire_context;
 WEAK halide_cuda_release_context_t release_context = (halide_cuda_release_context_t)halide_default_cuda_release_context;
 WEAK halide_cuda_get_stream_t get_stream = (halide_cuda_get_stream_t)halide_default_cuda_get_stream;
+WEAK int jit_max_registers = 64;
 
 }  // namespace CUDA
 }  // namespace Internal
@@ -254,6 +255,12 @@ WEAK int halide_cuda_get_stream(void *user_context, CUcontext ctx, CUstream *str
 WEAK halide_cuda_get_stream_t halide_set_cuda_get_stream(halide_cuda_get_stream_t handler) {
     halide_cuda_get_stream_t result = CUDA::get_stream;
     CUDA::get_stream = handler;
+    return result;
+}
+
+WEAK int halide_set_cuda_jit_max_registers(int max_registers) {
+    int result = CUDA::jit_max_registers;
+    CUDA::jit_max_registers = max_registers;
     return result;
 }
 }
@@ -527,7 +534,7 @@ WEAK CUmodule compile_kernel(void *user_context, const char *ptx_src, int size) 
     debug(user_context) << "CUDA: compile_kernel cuModuleLoadData " << (void *)ptx_src << ", " << size << " -> ";
 
     CUjit_option options[] = {CU_JIT_MAX_REGISTERS};
-    unsigned int max_regs_per_thread = 64;
+    unsigned int max_regs_per_thread = CUDA::jit_max_registers;
 
     // A hack to enable control over max register count for
     // testing. This should be surfaced in the schedule somehow
