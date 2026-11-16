@@ -100,6 +100,12 @@ struct halide_cuda_device_allocator_t {
  * the previous allocator. */
 extern const struct halide_cuda_device_allocator_t *halide_set_cuda_device_allocator(const struct halide_cuda_device_allocator_t *allocator);
 
+/** Set the maximum number of registers per thread passed to the CUDA JIT
+ * (CU_JIT_MAX_REGISTERS) when compiling kernels. Only affects kernels
+ * compiled after the call. The HL_CUDA_JIT_MAX_REGISTERS environment
+ * variable takes precedence. The default is 64. Returns the previous value. */
+extern int halide_set_cuda_jit_max_registers(int max_registers);
+
 #ifdef __cplusplus
 }  // End extern "C"
 #endif
